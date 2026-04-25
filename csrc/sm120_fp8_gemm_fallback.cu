@@ -7,6 +7,9 @@
 #include <cuda_fp8.h>
 #include <torch/python.h>
 
+#include "cute/arch/mma_sm120.hpp"
+#include "cutlass/numeric_types.h"
+
 #include "jit_kernels/impls/sm120_fp8_gemm_fallback.hpp"
 #include "utils/system.hpp"
 #include "jit_kernels/impls/smxx_cublaslt.hpp"
@@ -114,6 +117,20 @@ __device__ __forceinline__ float load_scale_any(const void* sf,
 	    const int parsed = std::atoi(value);
 	    return parsed > 0 ? parsed : default_value;
 	}
+
+    bool env_flag_enabled(const char* name) {
+        const char* value = std::getenv(name);
+        return value != nullptr && std::strcmp(value, "0") != 0 &&
+               std::strcmp(value, "false") != 0 &&
+               std::strcmp(value, "False") != 0;
+    }
+
+__device__ __forceinline__ uint8_t load_ue8m0_raw_packed(
+    const int32_t* scale, int64_t base, int64_t stride_last, int k_block) {
+    const int32_t word =
+        scale[base + static_cast<int64_t>(k_block / 4) * stride_last];
+    return static_cast<uint8_t>((word >> ((k_block & 3) * 8)) & 0xff);
+}
 
 __global__ void dequant_fp8_c128_kernel(const __nv_fp8_e4m3* x,
                                         const void* scale,
@@ -463,6 +480,117 @@ __global__ void fp8_c128_m1_predecoded_a_kblock_scale_gemm_kernel(
     }
 }
 
+template <typename out_t, int kColsPerBlock>
+__global__ void fp8_c128_m1_predecoded_a_regscale_gemm_kernel(
+    const float* __restrict__ a_dequant, const uint8_t* __restrict__ b,
+    const void* __restrict__ sfb, out_t* __restrict__ d, int sfb_type, int n,
+    int k, int64_t b_stride0, int64_t b_stride1, int64_t d_stride1,
+    int64_t sfb_stride0, int64_t sfb_stride1, int gran_mn_b, int gran_k_b,
+    bool accumulate) {
+    __shared__ float reductions[kColsPerBlock][8];
+    float partial[kColsPerBlock];
+#pragma unroll
+    for (int i = 0; i < kColsPerBlock; ++i)
+        partial[i] = 0.0f;
+
+    const int col_base = blockIdx.x * kColsPerBlock;
+    for (int k_block_start = 0; k_block_start < k;
+         k_block_start += gran_k_b) {
+        float block_scales[kColsPerBlock];
+#pragma unroll
+        for (int i = 0; i < kColsPerBlock; ++i) {
+            const int col = col_base + i;
+            block_scales[i] =
+                col < n ? load_scale_any(sfb, sfb_type, col, k_block_start,
+                                          gran_mn_b, gran_k_b, sfb_stride0,
+                                          sfb_stride1)
+                        : 0.0f;
+        }
+
+        const int k_block_end = min(k, k_block_start + gran_k_b);
+        for (int kk = k_block_start + threadIdx.x; kk < k_block_end;
+             kk += blockDim.x) {
+            const float av = a_dequant[kk];
+#pragma unroll
+            for (int i = 0; i < kColsPerBlock; ++i) {
+                const int col = col_base + i;
+                if (col < n) {
+                    const float bv = fp8_e4m3fn_to_float(
+                        b[static_cast<int64_t>(col) * b_stride0 +
+                          static_cast<int64_t>(kk) * b_stride1]);
+                    partial[i] += av * bv * block_scales[i];
+                }
+            }
+        }
+    }
+
+    reduce_cols_in_block<kColsPerBlock>(partial, reductions);
+
+    if (threadIdx.x == 0) {
+#pragma unroll
+        for (int i = 0; i < kColsPerBlock; ++i) {
+            const int col = col_base + i;
+            if (col < n) {
+                const int64_t out_offset =
+                    static_cast<int64_t>(col) * d_stride1;
+                float value = reductions[i][0];
+                if (accumulate)
+                    value += load_direct_gemm<out_t>(d, out_offset);
+                store_direct_gemm<out_t>(d, out_offset, value);
+            }
+        }
+    }
+}
+
+template <typename out_t, int kWarpsPerBlock>
+__global__ void fp8_c128_m1_predecoded_a_warp_col_gemm_kernel(
+    const float* __restrict__ a_dequant, const uint8_t* __restrict__ b,
+    const void* __restrict__ sfb, out_t* __restrict__ d, int sfb_type, int n,
+    int k, int64_t b_stride0, int64_t b_stride1, int64_t d_stride1,
+    int64_t sfb_stride0, int64_t sfb_stride1, int gran_mn_b, int gran_k_b,
+    bool accumulate) {
+    const int warp_id = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    if (warp_id >= kWarpsPerBlock)
+        return;
+
+    const int col = blockIdx.x * kWarpsPerBlock + warp_id;
+    if (col >= n)
+        return;
+
+    float partial = 0.0f;
+    for (int k_block_start = 0; k_block_start < k;
+         k_block_start += gran_k_b) {
+        float bs = 0.0f;
+        if (lane == 0) {
+            bs = load_scale_any(sfb, sfb_type, col, k_block_start,
+                                gran_mn_b, gran_k_b, sfb_stride0,
+                                sfb_stride1);
+        }
+        bs = __shfl_sync(0xffffffff, bs, 0);
+
+        const int k_block_end = min(k, k_block_start + gran_k_b);
+        for (int kk = k_block_start + lane; kk < k_block_end; kk += 32) {
+            const float bv = fp8_e4m3fn_to_float(
+                b[static_cast<int64_t>(col) * b_stride0 +
+                  static_cast<int64_t>(kk) * b_stride1]);
+            partial += a_dequant[kk] * bv * bs;
+        }
+    }
+
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        partial += __shfl_down_sync(0xffffffff, partial, offset);
+
+    if (lane == 0) {
+        const int64_t out_offset = static_cast<int64_t>(col) * d_stride1;
+        float value = partial;
+        if (accumulate)
+            value += load_direct_gemm<out_t>(d, out_offset);
+        store_direct_gemm<out_t>(d, out_offset, value);
+    }
+}
+
 template <typename out_t, int kDPerBlock>
 __global__ void fp8_bhr_hdr_bhd_kernel(
     const uint8_t* __restrict__ a, const void* __restrict__ a_scale,
@@ -533,6 +661,384 @@ __global__ void fp8_bhr_hdr_bhd_kernel(
                              static_cast<int64_t>(h) * out_s1 +
                              static_cast<int64_t>(d) * out_s2,
                     reductions[i][0]);
+            }
+        }
+    }
+}
+
+template <typename out_t, int kDPerBlock>
+__global__ void fp8_bhr_hdr_bhd_kblock_scale_kernel(
+    const uint8_t* __restrict__ a, const void* __restrict__ a_scale,
+    const uint8_t* __restrict__ b, const void* __restrict__ b_scale,
+    out_t* __restrict__ out, int B, int H, int D, int R, int b_dim,
+    int b_scale_dim, int b_scale_d_size, int b_scale_gran_d, int a_scale_type,
+    int b_scale_type, int64_t a_s0, int64_t a_s1, int64_t a_s2,
+    int64_t b_s0, int64_t b_s1, int64_t b_s2, int64_t out_s0,
+    int64_t out_s1, int64_t out_s2, int64_t as_s0, int64_t as_s1,
+    int64_t as_s2, int64_t bs_s0, int64_t bs_s1, int64_t bs_s2) {
+    __shared__ float reductions[kDPerBlock][8];
+    const int linear = blockIdx.x;
+    const int d_blocks = (D + kDPerBlock - 1) / kDPerBlock;
+    const int d_base = (linear % d_blocks) * kDPerBlock;
+    const int h = (linear / d_blocks) % H;
+    const int batch = linear / (d_blocks * H);
+    float partial[kDPerBlock];
+#pragma unroll
+    for (int i = 0; i < kDPerBlock; ++i)
+        partial[i] = 0.0f;
+
+    const int64_t a_base = static_cast<int64_t>(batch) * a_s0 +
+                           static_cast<int64_t>(h) * a_s1;
+    const int64_t as_base = static_cast<int64_t>(batch) * as_s0 +
+                            static_cast<int64_t>(h) * as_s1;
+
+    for (int k_block_start = 0, k_block = 0; k_block_start < R;
+         k_block_start += 128, ++k_block) {
+        const float as =
+            load_vec128_scale(a_scale, a_scale_type, as_base, as_s2, k_block);
+        float bs_vals[kDPerBlock];
+#pragma unroll
+        for (int i = 0; i < kDPerBlock; ++i) {
+            const int d = d_base + i;
+            if (d < D) {
+                const int scale_d = d / b_scale_gran_d;
+                const int64_t bs_base =
+                    b_scale_dim == 3
+                        ? static_cast<int64_t>(h) * bs_s0 +
+                              static_cast<int64_t>(scale_d) * bs_s1
+                        : static_cast<int64_t>(h * b_scale_d_size + scale_d) *
+                              bs_s0;
+                bs_vals[i] = load_vec128_scale(
+                    b_scale, b_scale_type, bs_base,
+                    b_scale_dim == 3 ? bs_s2 : bs_s1, k_block);
+            } else {
+                bs_vals[i] = 0.0f;
+            }
+        }
+
+        const int k_block_end = min(R, k_block_start + 128);
+        for (int rr = k_block_start + threadIdx.x; rr < k_block_end;
+             rr += blockDim.x) {
+            const float a_scaled =
+                fp8_e4m3fn_to_float(
+                    a[a_base + static_cast<int64_t>(rr) * a_s2]) *
+                as;
+#pragma unroll
+            for (int i = 0; i < kDPerBlock; ++i) {
+                const int d = d_base + i;
+                if (d < D) {
+                    const int64_t b_base =
+                        b_dim == 3 ? static_cast<int64_t>(h) * b_s0 +
+                                         static_cast<int64_t>(d) * b_s1
+                                   : static_cast<int64_t>(h * D + d) * b_s0;
+                    const float bv = fp8_e4m3fn_to_float(
+                        b[b_base + static_cast<int64_t>(rr) *
+                                       (b_dim == 3 ? b_s2 : b_s1)]);
+                    partial[i] += a_scaled * bv * bs_vals[i];
+                }
+            }
+        }
+    }
+
+    reduce_cols_in_block<kDPerBlock>(partial, reductions);
+
+    if (threadIdx.x == 0) {
+#pragma unroll
+        for (int i = 0; i < kDPerBlock; ++i) {
+            const int d = d_base + i;
+            if (d < D) {
+                store_direct_gemm<out_t>(
+                    out, static_cast<int64_t>(batch) * out_s0 +
+                             static_cast<int64_t>(h) * out_s1 +
+                             static_cast<int64_t>(d) * out_s2,
+                    reductions[i][0]);
+            }
+        }
+    }
+}
+
+__global__ void fp8_bhr_hdr_bhd_m1_mma_kernel(
+    const uint8_t* __restrict__ a, const int32_t* __restrict__ a_scale,
+    const uint8_t* __restrict__ b, const int32_t* __restrict__ b_scale,
+    __nv_bfloat16* __restrict__ out, int B, int H, int D, int R, int b_dim,
+    int b_scale_dim, int b_scale_d_size, int b_scale_gran_d, int64_t a_s0,
+    int64_t a_s1, int64_t a_s2, int64_t b_s0, int64_t b_s1,
+    int64_t b_s2, int64_t out_s0, int64_t out_s1, int64_t out_s2,
+    int64_t as_s0, int64_t as_s1, int64_t as_s2, int64_t bs_s0,
+    int64_t bs_s1, int64_t bs_s2) {
+#if defined(CUTE_ARCH_MXF8F6F4_MMA_ENABLED)
+    using MmaOp = cute::SM120::BLOCKSCALED::SM120_16x8x32_TN_VS<
+        cutlass::float_e4m3_t, cutlass::float_e4m3_t, float,
+        cutlass::float_ue8m0_t, 32>;
+
+    constexpr int kWarpsPerBlock = 4;
+    const int warp_id = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int t0 = lane & 3;
+    const int t1 = lane >> 2;
+    if (warp_id >= kWarpsPerBlock)
+        return;
+
+    const int d_tiles_per_h = (D + kWarpsPerBlock * 8 - 1) /
+                              (kWarpsPerBlock * 8);
+    const int tile = blockIdx.x % d_tiles_per_h;
+    const int h = (blockIdx.x / d_tiles_per_h) % H;
+    const int batch = blockIdx.x / (d_tiles_per_h * H);
+    if (batch >= B)
+        return;
+
+    const int col_base = (tile * kWarpsPerBlock + warp_id) * 8;
+    if (col_base >= D)
+        return;
+
+    const int k32 = R / 32;
+    const int gran_k_blocks = 128 / 32;
+    const int64_t a_base = static_cast<int64_t>(batch) * a_s0 +
+                           static_cast<int64_t>(h) * a_s1;
+    const int64_t as_base = static_cast<int64_t>(batch) * as_s0 +
+                            static_cast<int64_t>(h) * as_s1;
+
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+#pragma unroll 1
+    for (int kb = 0; kb < k32; ++kb) {
+        uint32_t a_reg[4] = {0u, 0u, 0u, 0u};
+        uint32_t b_reg[2] = {0u, 0u};
+
+#pragma unroll
+        for (int v = 0; v < 16; ++v) {
+            const int v0 = v & 3;
+            const int v1 = (v >> 2) & 1;
+            const int v2 = v >> 3;
+            const int offset = t0 * 64 + t1 + v0 * 16 + v1 * 8 + v2 * 256;
+            const int local_row = offset & 15;
+            const int kk = offset >> 4;
+            uint8_t value = 0;
+            if (local_row == 0) {
+                value = a[a_base + static_cast<int64_t>(kb * 32 + kk) * a_s2];
+            }
+            a_reg[v >> 2] |= static_cast<uint32_t>(value) << ((v & 3) * 8);
+        }
+
+#pragma unroll
+        for (int v = 0; v < 8; ++v) {
+            const int v0 = v & 3;
+            const int v1 = v >> 2;
+            const int offset = t0 * 32 + t1 + v0 * 8 + v1 * 128;
+            const int kk = offset >> 3;
+            const int n_local = offset & 7;
+            const int d = col_base + n_local;
+            uint8_t value = 0;
+            if (d < D) {
+                const int64_t b_base =
+                    b_dim == 3 ? static_cast<int64_t>(h) * b_s0 +
+                                     static_cast<int64_t>(d) * b_s1
+                               : static_cast<int64_t>(h * D + d) * b_s0;
+                value = b[b_base + static_cast<int64_t>(kb * 32 + kk) *
+                                       (b_dim == 3 ? b_s2 : b_s1)];
+            }
+            b_reg[v >> 2] |= static_cast<uint32_t>(value) << ((v & 3) * 8);
+        }
+
+        const int k_block = kb / gran_k_blocks;
+        const uint8_t sfa_value =
+            load_ue8m0_raw_packed(a_scale, as_base, as_s2, k_block);
+        const int scale_d = min(col_base + t1, D - 1) / b_scale_gran_d;
+        const int64_t bs_base =
+            b_scale_dim == 3
+                ? static_cast<int64_t>(h) * bs_s0 +
+                      static_cast<int64_t>(scale_d) * bs_s1
+                : static_cast<int64_t>(h * b_scale_d_size + scale_d) * bs_s0;
+        const uint8_t sfb_value =
+            load_ue8m0_raw_packed(b_scale, bs_base, bs_s2, k_block);
+
+        MmaOp::fma(acc[0], acc[1], acc[2], acc[3], a_reg[0], a_reg[1],
+                   a_reg[2], a_reg[3], b_reg[0], b_reg[1], acc[0], acc[1],
+                   acc[2], acc[3], sfa_value, sfb_value);
+    }
+
+    if (t1 == 0) {
+        const int d0 = col_base + t0 * 2;
+        const int64_t out_base = static_cast<int64_t>(batch) * out_s0 +
+                                 static_cast<int64_t>(h) * out_s1;
+        if (d0 < D)
+            out[out_base + static_cast<int64_t>(d0) * out_s2] =
+                __float2bfloat16(acc[0]);
+        const int d1 = d0 + 1;
+        if (d1 < D)
+            out[out_base + static_cast<int64_t>(d1) * out_s2] =
+                __float2bfloat16(acc[1]);
+    }
+#endif
+}
+
+template <typename out_t, int kWarpsPerBlock>
+__global__ void fp8_bhr_hdr_bhd_warp_single_col_kernel(
+    const uint8_t* __restrict__ a, const void* __restrict__ a_scale,
+    const uint8_t* __restrict__ b, const void* __restrict__ b_scale,
+    out_t* __restrict__ out, int B, int H, int D, int R, int b_dim,
+    int b_scale_dim, int b_scale_d_size, int b_scale_gran_d, int a_scale_type,
+    int b_scale_type, int64_t a_s0, int64_t a_s1, int64_t a_s2,
+    int64_t b_s0, int64_t b_s1, int64_t b_s2, int64_t out_s0,
+    int64_t out_s1, int64_t out_s2, int64_t as_s0, int64_t as_s1,
+    int64_t as_s2, int64_t bs_s0, int64_t bs_s1, int64_t bs_s2) {
+    const int warp_id = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    if (warp_id >= kWarpsPerBlock)
+        return;
+
+    const int linear_col = blockIdx.x * kWarpsPerBlock + warp_id;
+    const int d = linear_col % D;
+    const int h = (linear_col / D) % H;
+    const int batch = linear_col / (D * H);
+    if (batch >= B)
+        return;
+
+    const int64_t a_base = static_cast<int64_t>(batch) * a_s0 +
+                           static_cast<int64_t>(h) * a_s1;
+    const int64_t as_base = static_cast<int64_t>(batch) * as_s0 +
+                            static_cast<int64_t>(h) * as_s1;
+    const int64_t b_base =
+        b_dim == 3 ? static_cast<int64_t>(h) * b_s0 +
+                         static_cast<int64_t>(d) * b_s1
+                   : static_cast<int64_t>(h * D + d) * b_s0;
+    const int scale_d = d / b_scale_gran_d;
+    const int64_t bs_base =
+        b_scale_dim == 3
+            ? static_cast<int64_t>(h) * bs_s0 +
+                  static_cast<int64_t>(scale_d) * bs_s1
+            : static_cast<int64_t>(h * b_scale_d_size + scale_d) * bs_s0;
+    const int64_t b_r_stride = b_dim == 3 ? b_s2 : b_s1;
+    const int64_t bs_k_stride = b_scale_dim == 3 ? bs_s2 : bs_s1;
+
+    float partial = 0.0f;
+    for (int k_block_start = 0, k_block = 0; k_block_start < R;
+         k_block_start += 128, ++k_block) {
+        const float as =
+            load_vec128_scale(a_scale, a_scale_type, as_base, as_s2, k_block);
+        const float bs = load_vec128_scale(b_scale, b_scale_type, bs_base,
+                                           bs_k_stride, k_block);
+        const float scale = as * bs;
+        const int k_block_end = min(R, k_block_start + 128);
+        for (int rr = k_block_start + lane; rr < k_block_end; rr += 32) {
+            const float av =
+                fp8_e4m3fn_to_float(a[a_base + static_cast<int64_t>(rr) * a_s2]);
+            const float bv =
+                fp8_e4m3fn_to_float(b[b_base + static_cast<int64_t>(rr) *
+                                                   b_r_stride]);
+            partial += av * bv * scale;
+        }
+    }
+
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        partial += __shfl_down_sync(0xffffffff, partial, offset);
+
+    if (lane == 0) {
+        store_direct_gemm<out_t>(
+            out, static_cast<int64_t>(batch) * out_s0 +
+                     static_cast<int64_t>(h) * out_s1 +
+                     static_cast<int64_t>(d) * out_s2,
+            partial);
+    }
+}
+
+template <typename out_t, int kWarpsPerBlock, int kColsPerWarp>
+__global__ void fp8_bhr_hdr_bhd_warp_multi_col_kernel(
+    const uint8_t* __restrict__ a, const void* __restrict__ a_scale,
+    const uint8_t* __restrict__ b, const void* __restrict__ b_scale,
+    out_t* __restrict__ out, int B, int H, int D, int R, int b_dim,
+    int b_scale_dim, int b_scale_d_size, int b_scale_gran_d, int a_scale_type,
+    int b_scale_type, int64_t a_s0, int64_t a_s1, int64_t a_s2,
+    int64_t b_s0, int64_t b_s1, int64_t b_s2, int64_t out_s0,
+    int64_t out_s1, int64_t out_s2, int64_t as_s0, int64_t as_s1,
+    int64_t as_s2, int64_t bs_s0, int64_t bs_s1, int64_t bs_s2) {
+    const int warp_id = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    if (warp_id >= kWarpsPerBlock)
+        return;
+
+    const int d_groups = (D + kColsPerWarp - 1) / kColsPerWarp;
+    const int linear_group = blockIdx.x * kWarpsPerBlock + warp_id;
+    const int d_base = (linear_group % d_groups) * kColsPerWarp;
+    const int h = (linear_group / d_groups) % H;
+    const int batch = linear_group / (d_groups * H);
+    if (batch >= B)
+        return;
+
+    const int64_t a_base = static_cast<int64_t>(batch) * a_s0 +
+                           static_cast<int64_t>(h) * a_s1;
+    const int64_t as_base = static_cast<int64_t>(batch) * as_s0 +
+                            static_cast<int64_t>(h) * as_s1;
+    const int64_t b_r_stride = b_dim == 3 ? b_s2 : b_s1;
+    const int64_t bs_k_stride = b_scale_dim == 3 ? bs_s2 : bs_s1;
+
+    float partial[kColsPerWarp];
+#pragma unroll
+    for (int i = 0; i < kColsPerWarp; ++i)
+        partial[i] = 0.0f;
+    for (int k_block_start = 0, k_block = 0; k_block_start < R;
+         k_block_start += 128, ++k_block) {
+        const float as =
+            load_vec128_scale(a_scale, a_scale_type, as_base, as_s2, k_block);
+        float scale[kColsPerWarp];
+        int64_t b_base[kColsPerWarp];
+#pragma unroll
+        for (int i = 0; i < kColsPerWarp; ++i) {
+            const int d = d_base + i;
+            if (d < D) {
+                b_base[i] = b_dim == 3
+                                ? static_cast<int64_t>(h) * b_s0 +
+                                      static_cast<int64_t>(d) * b_s1
+                                : static_cast<int64_t>(h * D + d) * b_s0;
+                const int scale_d = d / b_scale_gran_d;
+                const int64_t bs_base =
+                    b_scale_dim == 3
+                        ? static_cast<int64_t>(h) * bs_s0 +
+                              static_cast<int64_t>(scale_d) * bs_s1
+                        : static_cast<int64_t>(h * b_scale_d_size + scale_d) *
+                              bs_s0;
+                const float bs = load_vec128_scale(
+                    b_scale, b_scale_type, bs_base, bs_k_stride, k_block);
+                scale[i] = as * bs;
+            } else {
+                b_base[i] = 0;
+                scale[i] = 0.0f;
+            }
+        }
+        const int k_block_end = min(R, k_block_start + 128);
+        for (int rr = k_block_start + lane; rr < k_block_end; rr += 32) {
+            const float av =
+                fp8_e4m3fn_to_float(a[a_base + static_cast<int64_t>(rr) * a_s2]);
+#pragma unroll
+            for (int i = 0; i < kColsPerWarp; ++i) {
+                const int d = d_base + i;
+                if (d < D) {
+                    const float bv = fp8_e4m3fn_to_float(
+                        b[b_base[i] + static_cast<int64_t>(rr) * b_r_stride]);
+                    partial[i] += av * bv * scale[i];
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int i = 0; i < kColsPerWarp; ++i) {
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            partial[i] += __shfl_down_sync(0xffffffff, partial[i], offset);
+    }
+
+    if (lane == 0) {
+        const int64_t out_base = static_cast<int64_t>(batch) * out_s0 +
+                                 static_cast<int64_t>(h) * out_s1;
+#pragma unroll
+        for (int i = 0; i < kColsPerWarp; ++i) {
+            const int d = d_base + i;
+            if (d < D) {
+                store_direct_gemm<out_t>(
+                    out, out_base + static_cast<int64_t>(d) * out_s2,
+                    partial[i]);
             }
         }
     }
@@ -770,6 +1276,14 @@ void predecoded_a_fp8_c128_gemm_m1(const torch::Tensor& a,
     const bool use_kblock_scale =
         std::getenv("DG_SM120_ENABLE_FP8_M1_KBLOCK") != nullptr &&
         gran_k_b > 0 && gran_k_b <= 256;
+    const bool use_regscale =
+        std::getenv("DG_SM120_ENABLE_FP8_M1_REGSCALE") != nullptr &&
+        gran_k_b > 0 && gran_k_b <= 256;
+    const bool use_warp_col =
+        (std::getenv("DG_SM120_ENABLE_FP8_M1_WARPCOL") != nullptr ||
+         (std::getenv("DG_SM120_ENABLE_FP8_M1_WARPCOL_HEURISTIC") != nullptr &&
+          n <= 2048 && k >= 4096)) &&
+        gran_k_b > 0 && gran_k_b <= 256;
     const char* kblock_cols_env = std::getenv("DG_SM120_FP8_M1_KBLOCK_COLS");
     const int kblock_cols =
         kblock_cols_env != nullptr
@@ -779,7 +1293,57 @@ void predecoded_a_fp8_c128_gemm_m1(const torch::Tensor& a,
         env_int_or_default("DG_SM120_FP8_M1_KBLOCK_THREADS", 128);
 
     if (d.scalar_type() == torch::kBFloat16) {
-        if (use_kblock_scale && kblock_cols >= 16) {
+        if (use_warp_col && kblock_cols >= 8) {
+            fp8_c128_m1_predecoded_a_warp_col_gemm_kernel<__nv_bfloat16, 8>
+                <<<(n + 7) / 8, 8 * 32, 0, stream>>>(
+                    a_dequant.data_ptr<float>(),
+                    reinterpret_cast<const uint8_t*>(b.data_ptr()),
+                    sfb.data_ptr(),
+                    reinterpret_cast<__nv_bfloat16*>(d.data_ptr()), sfb_type,
+                    n, k, b.stride(0), b.stride(1), d.stride(1),
+                    sfb.stride(0), sfb.stride(1), gran_mn_b, gran_k_b,
+                    accumulate);
+        } else if (use_warp_col) {
+            fp8_c128_m1_predecoded_a_warp_col_gemm_kernel<__nv_bfloat16, 4>
+                <<<(n + 3) / 4, 4 * 32, 0, stream>>>(
+                    a_dequant.data_ptr<float>(),
+                    reinterpret_cast<const uint8_t*>(b.data_ptr()),
+                    sfb.data_ptr(),
+                    reinterpret_cast<__nv_bfloat16*>(d.data_ptr()), sfb_type,
+                    n, k, b.stride(0), b.stride(1), d.stride(1),
+                    sfb.stride(0), sfb.stride(1), gran_mn_b, gran_k_b,
+                    accumulate);
+        } else if (use_regscale && kblock_cols >= 16) {
+            fp8_c128_m1_predecoded_a_regscale_gemm_kernel<__nv_bfloat16, 16>
+                <<<(n + 15) / 16, kblock_threads, 0, stream>>>(
+                    a_dequant.data_ptr<float>(),
+                    reinterpret_cast<const uint8_t*>(b.data_ptr()),
+                    sfb.data_ptr(),
+                    reinterpret_cast<__nv_bfloat16*>(d.data_ptr()), sfb_type,
+                    n, k, b.stride(0), b.stride(1), d.stride(1),
+                    sfb.stride(0), sfb.stride(1), gran_mn_b, gran_k_b,
+                    accumulate);
+        } else if (use_regscale && kblock_cols >= 8) {
+            fp8_c128_m1_predecoded_a_regscale_gemm_kernel<__nv_bfloat16, 8>
+                <<<(n + 7) / 8, kblock_threads, 0, stream>>>(
+                    a_dequant.data_ptr<float>(),
+                    reinterpret_cast<const uint8_t*>(b.data_ptr()),
+                    sfb.data_ptr(),
+                    reinterpret_cast<__nv_bfloat16*>(d.data_ptr()), sfb_type,
+                    n, k, b.stride(0), b.stride(1), d.stride(1),
+                    sfb.stride(0), sfb.stride(1), gran_mn_b, gran_k_b,
+                    accumulate);
+        } else if (use_regscale) {
+            fp8_c128_m1_predecoded_a_regscale_gemm_kernel<__nv_bfloat16, 4>
+                <<<(n + 3) / 4, kblock_threads, 0, stream>>>(
+                    a_dequant.data_ptr<float>(),
+                    reinterpret_cast<const uint8_t*>(b.data_ptr()),
+                    sfb.data_ptr(),
+                    reinterpret_cast<__nv_bfloat16*>(d.data_ptr()), sfb_type,
+                    n, k, b.stride(0), b.stride(1), d.stride(1),
+                    sfb.stride(0), sfb.stride(1), gran_mn_b, gran_k_b,
+                    accumulate);
+        } else if (use_kblock_scale && kblock_cols >= 16) {
             fp8_c128_m1_predecoded_a_kblock_scale_gemm_kernel<__nv_bfloat16, 16>
                 <<<(n + 15) / 16, kblock_threads, 0, stream>>>(
                     a_dequant.data_ptr<float>(),
@@ -831,7 +1395,47 @@ void predecoded_a_fp8_c128_gemm_m1(const torch::Tensor& a,
                     accumulate);
         }
     } else if (d.scalar_type() == torch::kFloat32) {
-        if (use_kblock_scale && kblock_cols >= 16) {
+        if (use_warp_col && kblock_cols >= 8) {
+            fp8_c128_m1_predecoded_a_warp_col_gemm_kernel<float, 8>
+                <<<(n + 7) / 8, 8 * 32, 0, stream>>>(
+                    a_dequant.data_ptr<float>(),
+                    reinterpret_cast<const uint8_t*>(b.data_ptr()),
+                    sfb.data_ptr(), d.data_ptr<float>(), sfb_type, n, k,
+                    b.stride(0), b.stride(1), d.stride(1), sfb.stride(0),
+                    sfb.stride(1), gran_mn_b, gran_k_b, accumulate);
+        } else if (use_warp_col) {
+            fp8_c128_m1_predecoded_a_warp_col_gemm_kernel<float, 4>
+                <<<(n + 3) / 4, 4 * 32, 0, stream>>>(
+                    a_dequant.data_ptr<float>(),
+                    reinterpret_cast<const uint8_t*>(b.data_ptr()),
+                    sfb.data_ptr(), d.data_ptr<float>(), sfb_type, n, k,
+                    b.stride(0), b.stride(1), d.stride(1), sfb.stride(0),
+                    sfb.stride(1), gran_mn_b, gran_k_b, accumulate);
+        } else if (use_regscale && kblock_cols >= 16) {
+            fp8_c128_m1_predecoded_a_regscale_gemm_kernel<float, 16>
+                <<<(n + 15) / 16, kblock_threads, 0, stream>>>(
+                    a_dequant.data_ptr<float>(),
+                    reinterpret_cast<const uint8_t*>(b.data_ptr()),
+                    sfb.data_ptr(), d.data_ptr<float>(), sfb_type, n, k,
+                    b.stride(0), b.stride(1), d.stride(1), sfb.stride(0),
+                    sfb.stride(1), gran_mn_b, gran_k_b, accumulate);
+        } else if (use_regscale && kblock_cols >= 8) {
+            fp8_c128_m1_predecoded_a_regscale_gemm_kernel<float, 8>
+                <<<(n + 7) / 8, kblock_threads, 0, stream>>>(
+                    a_dequant.data_ptr<float>(),
+                    reinterpret_cast<const uint8_t*>(b.data_ptr()),
+                    sfb.data_ptr(), d.data_ptr<float>(), sfb_type, n, k,
+                    b.stride(0), b.stride(1), d.stride(1), sfb.stride(0),
+                    sfb.stride(1), gran_mn_b, gran_k_b, accumulate);
+        } else if (use_regscale) {
+            fp8_c128_m1_predecoded_a_regscale_gemm_kernel<float, 4>
+                <<<(n + 3) / 4, kblock_threads, 0, stream>>>(
+                    a_dequant.data_ptr<float>(),
+                    reinterpret_cast<const uint8_t*>(b.data_ptr()),
+                    sfb.data_ptr(), d.data_ptr<float>(), sfb_type, n, k,
+                    b.stride(0), b.stride(1), d.stride(1), sfb.stride(0),
+                    sfb.stride(1), gran_mn_b, gran_k_b, accumulate);
+        } else if (use_kblock_scale && kblock_cols >= 16) {
             fp8_c128_m1_predecoded_a_kblock_scale_gemm_kernel<float, 16>
                 <<<(n + 15) / 16, kblock_threads, 0, stream>>>(
                     a_dequant.data_ptr<float>(),
@@ -1176,8 +1780,22 @@ void sm120_fp8_bhr_hdr_bhd(const torch::Tensor& a,
     const int64_t bs_s1 = b_scale_flat ? b_scale.stride(1) : b_scale.stride(1);
     const int64_t bs_s2 = b_scale_flat ? b_scale.stride(1) : b_scale.stride(2);
 
-	    constexpr int threads = 256;
-	    int d_per_block = env_int_or_default("DG_SM120_BHR_D_PER_BLOCK", 1);
+            const bool use_m1_mma =
+                env_flag_enabled("DG_SM120_ENABLE_BHR_M1_MMA") &&
+                out.scalar_type() == torch::kBFloat16 && a_scale_type == 1 &&
+                b_scale_type == 1 && R % 128 == 0 && D % 8 == 0 &&
+                b_scale_gran_d == 128;
+            const bool use_warp_col =
+                env_flag_enabled("DG_SM120_ENABLE_BHR_WARPCOL") ||
+                (env_flag_enabled("DG_SM120_ENABLE_BHR_WARPCOL_HEURISTIC") &&
+                 R >= 2048 && D <= 4096 && B * H <= 64);
+		    const bool use_kblock =
+		        std::getenv("DG_SM120_BHR_KBLOCK_SCALE") != nullptr &&
+		        R <= 512 && B * H <= 64 && !use_m1_mma && !use_warp_col;
+		    const int threads =
+		        use_kblock ? env_int_or_default("DG_SM120_BHR_KBLOCK_THREADS", 128)
+		                   : 256;
+		    int d_per_block = env_int_or_default("DG_SM120_BHR_D_PER_BLOCK", 1);
 	    if (d_per_block != 1 && d_per_block != 2 && d_per_block != 4 &&
 	        d_per_block != 8 && d_per_block != 16) {
 	        d_per_block = 1;
@@ -1187,21 +1805,149 @@ void sm120_fp8_bhr_hdr_bhd(const torch::Tensor& a,
             "sm120_fp8_bhr_hdr_bhd");
         sm120_profile::ScopedTimer profile_timer(
             profile_counter, stream, B, D, R, H);
-#define DG_SM120_LAUNCH_BHR(OUT_T, OUT_PTR, D_PER_BLOCK)                         \
-    do {                                                                         \
-        constexpr int kDPerBlockLaunch = D_PER_BLOCK;                            \
-        const int grid =                                                         \
-            B * H * ((D + kDPerBlockLaunch - 1) / kDPerBlockLaunch);             \
-        fp8_bhr_hdr_bhd_kernel<OUT_T, kDPerBlockLaunch>                          \
-            <<<grid, threads, 0, stream>>>(                                      \
-                reinterpret_cast<const uint8_t*>(a.data_ptr()), a_scale.data_ptr(), \
-                reinterpret_cast<const uint8_t*>(b.data_ptr()), b_scale.data_ptr(), \
-                OUT_PTR, B, H, D, R, b.dim(), b_scale.dim(), b_scale_d_size,     \
-                b_scale_gran_d, a_scale_type, b_scale_type, a.stride(0),         \
-                a.stride(1), a.stride(2), b.stride(0), b.stride(1),              \
-                b.dim() == 3 ? b.stride(2) : 0, out.stride(0), out.stride(1),    \
-                out.stride(2), as_s0, as_s1, as_s2, bs_s0, bs_s1, bs_s2);        \
-    } while (0)
+        if (use_m1_mma) {
+            constexpr int m1_warps_per_block = 4;
+            const int grid =
+                B * H * ((D + m1_warps_per_block * 8 - 1) /
+                         (m1_warps_per_block * 8));
+            fp8_bhr_hdr_bhd_m1_mma_kernel<<<grid, m1_warps_per_block * 32, 0,
+                                             stream>>>(
+                reinterpret_cast<const uint8_t*>(a.data_ptr()),
+                static_cast<const int32_t*>(a_scale.data_ptr()),
+                reinterpret_cast<const uint8_t*>(b.data_ptr()),
+                static_cast<const int32_t*>(b_scale.data_ptr()),
+                reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), B, H, D, R,
+                b.dim(), b_scale.dim(), b_scale_d_size, b_scale_gran_d,
+                a.stride(0), a.stride(1), a.stride(2), b.stride(0),
+                b.stride(1), b.dim() == 3 ? b.stride(2) : 0, out.stride(0),
+                out.stride(1), out.stride(2), as_s0, as_s1, as_s2, bs_s0,
+                bs_s1, bs_s2);
+            DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
+            return;
+        }
+        if (use_warp_col) {
+            int warps_per_block =
+                env_int_or_default("DG_SM120_BHR_WARPCOL_WARPS", 4);
+            if (warps_per_block != 8)
+                warps_per_block = 4;
+            int cols_per_warp =
+                env_int_or_default("DG_SM120_BHR_WARPCOL_COLS", 1);
+            if (cols_per_warp != 1 && cols_per_warp != 2 &&
+                cols_per_warp != 4) {
+                cols_per_warp = 2;
+            }
+            const int d_groups = (D + cols_per_warp - 1) / cols_per_warp;
+            const int grid =
+                (B * H * d_groups + warps_per_block - 1) / warps_per_block;
+#define DG_SM120_LAUNCH_BHR_WARPCOL(OUT_T, OUT_PTR, WARPS, COLS)        \
+            do {                                                        \
+                fp8_bhr_hdr_bhd_warp_multi_col_kernel<OUT_T, WARPS, COLS> \
+                    <<<grid, WARPS * 32, 0, stream>>>(                  \
+                        reinterpret_cast<const uint8_t*>(a.data_ptr()),  \
+                        a_scale.data_ptr(),                             \
+                        reinterpret_cast<const uint8_t*>(b.data_ptr()),  \
+                        b_scale.data_ptr(), OUT_PTR, B, H, D, R,        \
+                        b.dim(), b_scale.dim(), b_scale_d_size,         \
+                        b_scale_gran_d, a_scale_type, b_scale_type,     \
+                        a.stride(0), a.stride(1), a.stride(2),          \
+                        b.stride(0), b.stride(1),                       \
+                        b.dim() == 3 ? b.stride(2) : 0, out.stride(0),  \
+                        out.stride(1), out.stride(2), as_s0, as_s1,     \
+                        as_s2, bs_s0, bs_s1, bs_s2);                    \
+            } while (0)
+#define DG_SM120_LAUNCH_BHR_WARPSINGLE(OUT_T, OUT_PTR, WARPS)           \
+            do {                                                        \
+                fp8_bhr_hdr_bhd_warp_single_col_kernel<OUT_T, WARPS>    \
+                    <<<grid, WARPS * 32, 0, stream>>>(                  \
+                        reinterpret_cast<const uint8_t*>(a.data_ptr()),  \
+                        a_scale.data_ptr(),                             \
+                        reinterpret_cast<const uint8_t*>(b.data_ptr()),  \
+                        b_scale.data_ptr(), OUT_PTR, B, H, D, R,        \
+                        b.dim(), b_scale.dim(), b_scale_d_size,         \
+                        b_scale_gran_d, a_scale_type, b_scale_type,     \
+                        a.stride(0), a.stride(1), a.stride(2),          \
+                        b.stride(0), b.stride(1),                       \
+                        b.dim() == 3 ? b.stride(2) : 0, out.stride(0),  \
+                        out.stride(1), out.stride(2), as_s0, as_s1,     \
+                        as_s2, bs_s0, bs_s1, bs_s2);                    \
+            } while (0)
+            if (out.scalar_type() == torch::kBFloat16) {
+                auto* out_ptr = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
+                if (warps_per_block == 8) {
+                    if (cols_per_warp == 4) {
+                        DG_SM120_LAUNCH_BHR_WARPCOL(__nv_bfloat16, out_ptr, 8, 4);
+                    } else if (cols_per_warp == 2) {
+                        DG_SM120_LAUNCH_BHR_WARPCOL(__nv_bfloat16, out_ptr, 8, 2);
+                    } else {
+                        DG_SM120_LAUNCH_BHR_WARPSINGLE(__nv_bfloat16, out_ptr, 8);
+                    }
+                } else {
+                    if (cols_per_warp == 4) {
+                        DG_SM120_LAUNCH_BHR_WARPCOL(__nv_bfloat16, out_ptr, 4, 4);
+                    } else if (cols_per_warp == 2) {
+                        DG_SM120_LAUNCH_BHR_WARPCOL(__nv_bfloat16, out_ptr, 4, 2);
+                    } else {
+                        DG_SM120_LAUNCH_BHR_WARPSINGLE(__nv_bfloat16, out_ptr, 4);
+                    }
+                }
+            } else {
+                auto* out_ptr = out.data_ptr<float>();
+                if (warps_per_block == 8) {
+                    if (cols_per_warp == 4) {
+                        DG_SM120_LAUNCH_BHR_WARPCOL(float, out_ptr, 8, 4);
+                    } else if (cols_per_warp == 2) {
+                        DG_SM120_LAUNCH_BHR_WARPCOL(float, out_ptr, 8, 2);
+                    } else {
+                        DG_SM120_LAUNCH_BHR_WARPSINGLE(float, out_ptr, 8);
+                    }
+                } else {
+                    if (cols_per_warp == 4) {
+                        DG_SM120_LAUNCH_BHR_WARPCOL(float, out_ptr, 4, 4);
+                    } else if (cols_per_warp == 2) {
+                        DG_SM120_LAUNCH_BHR_WARPCOL(float, out_ptr, 4, 2);
+                    } else {
+                        DG_SM120_LAUNCH_BHR_WARPSINGLE(float, out_ptr, 4);
+                    }
+                }
+            }
+#undef DG_SM120_LAUNCH_BHR_WARPCOL
+#undef DG_SM120_LAUNCH_BHR_WARPSINGLE
+            DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
+            return;
+        }
+	#define DG_SM120_LAUNCH_BHR(OUT_T, OUT_PTR, D_PER_BLOCK)                         \
+	    do {                                                                         \
+	        constexpr int kDPerBlockLaunch = D_PER_BLOCK;                            \
+	        const int grid =                                                         \
+	            B * H * ((D + kDPerBlockLaunch - 1) / kDPerBlockLaunch);             \
+	        if (use_kblock) {                                                        \
+	            fp8_bhr_hdr_bhd_kblock_scale_kernel<OUT_T, kDPerBlockLaunch>         \
+	                <<<grid, threads, 0, stream>>>(                                  \
+	                    reinterpret_cast<const uint8_t*>(a.data_ptr()),              \
+	                    a_scale.data_ptr(),                                          \
+	                    reinterpret_cast<const uint8_t*>(b.data_ptr()),              \
+	                    b_scale.data_ptr(), OUT_PTR, B, H, D, R, b.dim(),            \
+	                    b_scale.dim(), b_scale_d_size, b_scale_gran_d,               \
+	                    a_scale_type, b_scale_type, a.stride(0), a.stride(1),        \
+	                    a.stride(2), b.stride(0), b.stride(1),                       \
+	                    b.dim() == 3 ? b.stride(2) : 0, out.stride(0),               \
+	                    out.stride(1), out.stride(2), as_s0, as_s1, as_s2, bs_s0,    \
+	                    bs_s1, bs_s2);                                               \
+	        } else {                                                                 \
+	            fp8_bhr_hdr_bhd_kernel<OUT_T, kDPerBlockLaunch>                      \
+	                <<<grid, threads, 0, stream>>>(                                  \
+	                    reinterpret_cast<const uint8_t*>(a.data_ptr()),              \
+	                    a_scale.data_ptr(),                                          \
+	                    reinterpret_cast<const uint8_t*>(b.data_ptr()),              \
+	                    b_scale.data_ptr(), OUT_PTR, B, H, D, R, b.dim(),            \
+	                    b_scale.dim(), b_scale_d_size, b_scale_gran_d,               \
+	                    a_scale_type, b_scale_type, a.stride(0), a.stride(1),        \
+	                    a.stride(2), b.stride(0), b.stride(1),                       \
+	                    b.dim() == 3 ? b.stride(2) : 0, out.stride(0),               \
+	                    out.stride(1), out.stride(2), as_s0, as_s1, as_s2, bs_s0,    \
+	                    bs_s1, bs_s2);                                               \
+	        }                                                                        \
+	    } while (0)
 	    if (out.scalar_type() == torch::kBFloat16) {
 	        auto* out_ptr = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
 	        switch (d_per_block) {

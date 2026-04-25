@@ -36,6 +36,9 @@ def make_case(m: int, n: int, k: int, device: str):
 def set_mode(mode: str) -> None:
     os.environ.pop("DG_SM120_ENABLE_FP8_M1_MMA", None)
     os.environ.pop("DG_SM120_ENABLE_FP8_M1_KBLOCK", None)
+    os.environ.pop("DG_SM120_ENABLE_FP8_M1_REGSCALE", None)
+    os.environ.pop("DG_SM120_ENABLE_FP8_M1_WARPCOL", None)
+    os.environ.pop("DG_SM120_ENABLE_FP8_M1_WARPCOL_HEURISTIC", None)
     os.environ.pop("DG_SM120_FP8_M1_KBLOCK_COLS", None)
     os.environ.pop("DG_SM120_FP8_M1_KBLOCK_THREADS", None)
     if mode == "cute":
@@ -47,6 +50,21 @@ def set_mode(mode: str) -> None:
             os.environ["DG_SM120_FP8_M1_KBLOCK_COLS"] = parts[1]
         if len(parts) >= 3:
             os.environ["DG_SM120_FP8_M1_KBLOCK_THREADS"] = parts[2]
+    elif mode.startswith("regscale"):
+        os.environ["DG_SM120_ENABLE_FP8_M1_REGSCALE"] = "1"
+        parts = mode.split(":")
+        if len(parts) >= 2:
+            os.environ["DG_SM120_FP8_M1_KBLOCK_COLS"] = parts[1]
+        if len(parts) >= 3:
+            os.environ["DG_SM120_FP8_M1_KBLOCK_THREADS"] = parts[2]
+    elif mode.startswith("warpcol"):
+        os.environ["DG_SM120_ENABLE_FP8_M1_WARPCOL"] = "1"
+        parts = mode.split(":")
+        if len(parts) >= 2:
+            os.environ["DG_SM120_FP8_M1_KBLOCK_COLS"] = parts[1]
+    elif mode == "hybrid":
+        os.environ["DG_SM120_ENABLE_FP8_M1_KBLOCK"] = "1"
+        os.environ["DG_SM120_ENABLE_FP8_M1_WARPCOL_HEURISTIC"] = "1"
 
 
 def call(case):
@@ -81,7 +99,7 @@ def main() -> None:
     parser.add_argument(
         "--modes",
         default=None,
-        help="Comma-separated modes: default, cute, kblock[:cols[:threads]]",
+        help="Comma-separated modes: default, cute, kblock[:cols[:threads]], regscale[:cols[:threads]], warpcol[:warps]",
     )
     args = parser.parse_args()
 
