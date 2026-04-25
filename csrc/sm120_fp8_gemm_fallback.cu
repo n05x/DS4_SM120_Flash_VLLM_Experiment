@@ -481,6 +481,72 @@ __global__ void fp8_c128_m1_predecoded_a_kblock_scale_gemm_kernel(
 }
 
 template <typename out_t, int kColsPerBlock>
+__global__ void fp8_c128_m1_predecoded_a_contig_ue8m0_kblock_gemm_kernel(
+    const float* __restrict__ a_dequant, const uint8_t* __restrict__ b,
+    const int32_t* __restrict__ sfb, out_t* __restrict__ d, int n, int k,
+    int64_t b_stride0, int64_t d_stride1, int64_t sfb_stride0,
+    int64_t sfb_stride1, bool accumulate) {
+    __shared__ float reductions[kColsPerBlock][8];
+    __shared__ float block_scales[kColsPerBlock];
+    float partial[kColsPerBlock];
+#pragma unroll
+    for (int i = 0; i < kColsPerBlock; ++i)
+        partial[i] = 0.0f;
+
+    const int col_base = blockIdx.x * kColsPerBlock;
+    for (int k_block_start = 0, k_block = 0; k_block_start < k;
+         k_block_start += 128, ++k_block) {
+        if (threadIdx.x < kColsPerBlock) {
+            const int col = col_base + threadIdx.x;
+            if (col < n) {
+                const int32_t word =
+                    sfb[static_cast<int64_t>(col) * sfb_stride0 +
+                        static_cast<int64_t>(k_block / 4) * sfb_stride1];
+                const int exponent = (word >> ((k_block & 3) * 8)) & 0xff;
+                block_scales[threadIdx.x] =
+                    scale_from_ue8m0_exponent(exponent);
+            } else {
+                block_scales[threadIdx.x] = 0.0f;
+            }
+        }
+        __syncthreads();
+
+        const int k_block_end = min(k, k_block_start + 128);
+        for (int kk = k_block_start + threadIdx.x; kk < k_block_end;
+             kk += blockDim.x) {
+            const float av = a_dequant[kk];
+#pragma unroll
+            for (int i = 0; i < kColsPerBlock; ++i) {
+                const int col = col_base + i;
+                if (col < n) {
+                    const float bv = fp8_e4m3fn_to_float(
+                        b[static_cast<int64_t>(col) * b_stride0 + kk]);
+                    partial[i] += av * bv * block_scales[i];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    reduce_cols_in_block<kColsPerBlock>(partial, reductions);
+
+    if (threadIdx.x == 0) {
+#pragma unroll
+        for (int i = 0; i < kColsPerBlock; ++i) {
+            const int col = col_base + i;
+            if (col < n) {
+                const int64_t out_offset =
+                    static_cast<int64_t>(col) * d_stride1;
+                float value = reductions[i][0];
+                if (accumulate)
+                    value += load_direct_gemm<out_t>(d, out_offset);
+                store_direct_gemm<out_t>(d, out_offset, value);
+            }
+        }
+    }
+}
+
+template <typename out_t, int kColsPerBlock>
 __global__ void fp8_c128_m1_predecoded_a_regscale_gemm_kernel(
     const float* __restrict__ a_dequant, const uint8_t* __restrict__ b,
     const void* __restrict__ sfb, out_t* __restrict__ d, int sfb_type, int n,
@@ -1261,36 +1327,55 @@ void predecoded_a_fp8_c128_gemm_m1(const torch::Tensor& a,
                                    const torch::Tensor& d, int n, int k,
                                    int gran_k_a, int gran_mn_b,
                                    int gran_k_b, bool accumulate) {
-    auto a_dequant = torch::empty({k}, a.options().dtype(torch::kFloat32));
     constexpr int threads = 256;
     const auto stream = at::cuda::getCurrentCUDAStream();
-    const int dequant_grid = fallback_grid(k);
     const int sfa_type = scale_tensor_type(sfa);
     const int sfb_type = scale_tensor_type(sfb);
-    fp8_c128_dequant_a_m1_kernel<<<dequant_grid, threads, 0, stream>>>(
-        reinterpret_cast<const uint8_t*>(a.data_ptr()), sfa.data_ptr(),
-        a_dequant.data_ptr<float>(), sfa_type, k, a.stride(1), sfa.stride(0),
-        sfa.stride(1), gran_k_a);
-    DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
-
     const bool use_kblock_scale =
         std::getenv("DG_SM120_ENABLE_FP8_M1_KBLOCK") != nullptr &&
         gran_k_b > 0 && gran_k_b <= 256;
     const bool use_regscale =
         std::getenv("DG_SM120_ENABLE_FP8_M1_REGSCALE") != nullptr &&
         gran_k_b > 0 && gran_k_b <= 256;
-    const bool use_warp_col =
+    const bool use_warp_col_requested =
         (std::getenv("DG_SM120_ENABLE_FP8_M1_WARPCOL") != nullptr ||
          (std::getenv("DG_SM120_ENABLE_FP8_M1_WARPCOL_HEURISTIC") != nullptr &&
           n <= 2048 && k >= 4096)) &&
         gran_k_b > 0 && gran_k_b <= 256;
     const char* kblock_cols_env = std::getenv("DG_SM120_FP8_M1_KBLOCK_COLS");
+    const char* kblock_threads_env =
+        std::getenv("DG_SM120_FP8_M1_KBLOCK_THREADS");
+    int default_kblock_cols = 4;
+    int default_kblock_threads = 128;
+    if (k <= 2048 && n >= 16384) {
+        default_kblock_cols = 8;
+    } else if (k <= 2048 && n >= 8192) {
+        default_kblock_cols = 4;
+        default_kblock_threads = 64;
+    }
     const int kblock_cols =
         kblock_cols_env != nullptr
             ? env_int_or_default("DG_SM120_FP8_M1_KBLOCK_COLS", 4)
-            : ((k <= 2048 && n >= 8192) ? 8 : 4);
+            : default_kblock_cols;
     const int kblock_threads =
-        env_int_or_default("DG_SM120_FP8_M1_KBLOCK_THREADS", 128);
+        kblock_threads_env != nullptr
+            ? env_int_or_default("DG_SM120_FP8_M1_KBLOCK_THREADS", 128)
+            : default_kblock_threads;
+    const bool use_contig_ue8m0_kblock =
+        use_kblock_scale &&
+        std::getenv("DG_SM120_DISABLE_FP8_M1_CONTIG_UE8M0_KBLOCK") == nullptr &&
+        sfb_type == 1 && gran_mn_b == 1 && gran_k_b == 128 &&
+        b.stride(1) == 1 && d.stride(1) == 1;
+    const bool use_warp_col =
+        use_warp_col_requested && !use_contig_ue8m0_kblock;
+
+    auto a_dequant = torch::empty({k}, a.options().dtype(torch::kFloat32));
+    const int dequant_grid = fallback_grid(k);
+    fp8_c128_dequant_a_m1_kernel<<<dequant_grid, threads, 0, stream>>>(
+        reinterpret_cast<const uint8_t*>(a.data_ptr()), sfa.data_ptr(),
+        a_dequant.data_ptr<float>(), sfa_type, k, a.stride(1), sfa.stride(0),
+        sfa.stride(1), gran_k_a);
+    DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
 
     if (d.scalar_type() == torch::kBFloat16) {
         if (use_warp_col && kblock_cols >= 8) {
@@ -1342,6 +1427,33 @@ void predecoded_a_fp8_c128_gemm_m1(const torch::Tensor& a,
                     reinterpret_cast<__nv_bfloat16*>(d.data_ptr()), sfb_type,
                     n, k, b.stride(0), b.stride(1), d.stride(1),
                     sfb.stride(0), sfb.stride(1), gran_mn_b, gran_k_b,
+                    accumulate);
+        } else if (use_contig_ue8m0_kblock && kblock_cols >= 16) {
+            fp8_c128_m1_predecoded_a_contig_ue8m0_kblock_gemm_kernel<__nv_bfloat16, 16>
+                <<<(n + 15) / 16, kblock_threads, 0, stream>>>(
+                    a_dequant.data_ptr<float>(),
+                    reinterpret_cast<const uint8_t*>(b.data_ptr()),
+                    static_cast<const int32_t*>(sfb.data_ptr()),
+                    reinterpret_cast<__nv_bfloat16*>(d.data_ptr()), n, k,
+                    b.stride(0), d.stride(1), sfb.stride(0), sfb.stride(1),
+                    accumulate);
+        } else if (use_contig_ue8m0_kblock && kblock_cols >= 8) {
+            fp8_c128_m1_predecoded_a_contig_ue8m0_kblock_gemm_kernel<__nv_bfloat16, 8>
+                <<<(n + 7) / 8, kblock_threads, 0, stream>>>(
+                    a_dequant.data_ptr<float>(),
+                    reinterpret_cast<const uint8_t*>(b.data_ptr()),
+                    static_cast<const int32_t*>(sfb.data_ptr()),
+                    reinterpret_cast<__nv_bfloat16*>(d.data_ptr()), n, k,
+                    b.stride(0), d.stride(1), sfb.stride(0), sfb.stride(1),
+                    accumulate);
+        } else if (use_contig_ue8m0_kblock) {
+            fp8_c128_m1_predecoded_a_contig_ue8m0_kblock_gemm_kernel<__nv_bfloat16, 4>
+                <<<(n + 3) / 4, kblock_threads, 0, stream>>>(
+                    a_dequant.data_ptr<float>(),
+                    reinterpret_cast<const uint8_t*>(b.data_ptr()),
+                    static_cast<const int32_t*>(sfb.data_ptr()),
+                    reinterpret_cast<__nv_bfloat16*>(d.data_ptr()), n, k,
+                    b.stride(0), d.stride(1), sfb.stride(0), sfb.stride(1),
                     accumulate);
         } else if (use_kblock_scale && kblock_cols >= 16) {
             fp8_c128_m1_predecoded_a_kblock_scale_gemm_kernel<__nv_bfloat16, 16>
@@ -1435,6 +1547,30 @@ void predecoded_a_fp8_c128_gemm_m1(const torch::Tensor& a,
                     sfb.data_ptr(), d.data_ptr<float>(), sfb_type, n, k,
                     b.stride(0), b.stride(1), d.stride(1), sfb.stride(0),
                     sfb.stride(1), gran_mn_b, gran_k_b, accumulate);
+        } else if (use_contig_ue8m0_kblock && kblock_cols >= 16) {
+            fp8_c128_m1_predecoded_a_contig_ue8m0_kblock_gemm_kernel<float, 16>
+                <<<(n + 15) / 16, kblock_threads, 0, stream>>>(
+                    a_dequant.data_ptr<float>(),
+                    reinterpret_cast<const uint8_t*>(b.data_ptr()),
+                    static_cast<const int32_t*>(sfb.data_ptr()),
+                    d.data_ptr<float>(), n, k, b.stride(0), d.stride(1),
+                    sfb.stride(0), sfb.stride(1), accumulate);
+        } else if (use_contig_ue8m0_kblock && kblock_cols >= 8) {
+            fp8_c128_m1_predecoded_a_contig_ue8m0_kblock_gemm_kernel<float, 8>
+                <<<(n + 7) / 8, kblock_threads, 0, stream>>>(
+                    a_dequant.data_ptr<float>(),
+                    reinterpret_cast<const uint8_t*>(b.data_ptr()),
+                    static_cast<const int32_t*>(sfb.data_ptr()),
+                    d.data_ptr<float>(), n, k, b.stride(0), d.stride(1),
+                    sfb.stride(0), sfb.stride(1), accumulate);
+        } else if (use_contig_ue8m0_kblock) {
+            fp8_c128_m1_predecoded_a_contig_ue8m0_kblock_gemm_kernel<float, 4>
+                <<<(n + 3) / 4, kblock_threads, 0, stream>>>(
+                    a_dequant.data_ptr<float>(),
+                    reinterpret_cast<const uint8_t*>(b.data_ptr()),
+                    static_cast<const int32_t*>(sfb.data_ptr()),
+                    d.data_ptr<float>(), n, k, b.stride(0), d.stride(1),
+                    sfb.stride(0), sfb.stride(1), accumulate);
         } else if (use_kblock_scale && kblock_cols >= 16) {
             fp8_c128_m1_predecoded_a_kblock_scale_gemm_kernel<float, 16>
                 <<<(n + 15) / 16, kblock_threads, 0, stream>>>(

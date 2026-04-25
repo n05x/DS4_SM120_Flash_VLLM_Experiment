@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 
@@ -749,6 +750,58 @@ def patch_flashmla_sparse_prefill() -> None:
             (q.shape[0], q.shape[1], d_v), device=q.device, dtype=q.dtype
         )
 
+    try:
+        import deep_gemm
+        import os
+
+        workspace_decode = getattr(
+            getattr(deep_gemm, "_C", None),
+            "sm120_sparse_mla_decode_from_bf16_workspace_split",
+            None,
+        )
+        chunk_size = int(os.environ.get("DG_SM120_PREFILL_WORKSPACE_CHUNK", "16"))
+        if workspace_decode is not None and chunk_size > 0:
+            kv_2d = kv[:, 0, :]
+            lse = torch.empty((q.shape[0], q.shape[1]), device=q.device,
+                              dtype=torch.float32)
+            max_logits = torch.empty_like(lse)
+            for start in range(0, q.shape[0], chunk_size):
+                end = min(start + chunk_size, q.shape[0])
+                idx = indices[start:end, 0, :].to(torch.long)
+                idx = idx.clamp(0, kv_2d.shape[0] - 1)
+                workspace = kv_2d[idx]
+                chunk_topk = None
+                if topk_length is not None:
+                    chunk_topk = topk_length[start:end]
+                chunk_out, chunk_lse = workspace_decode(
+                    q[start:end].unsqueeze(1),
+                    workspace,
+                    chunk_topk,
+                    None,
+                    attn_sink,
+                    workspace.shape[1],
+                    0,
+                    d_v,
+                    sm_scale,
+                    out[start:end].unsqueeze(1),
+                )
+                lse[start:end].copy_(chunk_lse.squeeze(-1))
+            max_logits.fill_(float("nan"))
+            return out, max_logits, lse
+
+        native_prefill = getattr(
+            getattr(deep_gemm, "_C", None),
+            "sm120_sparse_mla_prefill_from_bf16_workspace",
+            None,
+        )
+        if native_prefill is not None:
+            return native_prefill(
+                q, kv, indices, topk_length, attn_sink, d_v, sm_scale, out
+            )
+    except Exception:
+        # Keep the correctness fallback usable while the extension is rebuilt.
+        pass
+
     max_logits = torch.empty((q.shape[0], q.shape[1]), device=q.device,
                              dtype=torch.float32)
     lse = torch.empty_like(max_logits)
@@ -799,7 +852,18 @@ def patch_flashmla_sparse_prefill() -> None:
     if path is None or source is None:
         raise RuntimeError("Could not find flash_mla_sparse_fwd marker")
 
-    if helper not in source:
+    if (
+        "def _sm120_flash_mla_sparse_prefill_fwd" in source
+        and "DG_SM120_PREFILL_WORKSPACE_CHUNK" not in source
+    ):
+        source = re.sub(
+            r"def _sm120_flash_mla_sparse_prefill_fwd\(.*?\n\ndef flash_mla_sparse_fwd\(",
+            helper + "def flash_mla_sparse_fwd(",
+            source,
+            count=1,
+            flags=re.S,
+        )
+    elif helper not in source:
         source = source.replace(marker, helper + marker, 1)
 
     old = """    results = flash_mla_cuda.sparse_prefill_fwd(

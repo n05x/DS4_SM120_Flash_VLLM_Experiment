@@ -52,6 +52,13 @@ sparse_mla_decode_from_bf16_workspace_split(
     const pybind11::object& attn_sink, int main_topk, int extra_topk,
     int head_dim_v, double softmax_scale, const pybind11::object& out);
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+sparse_mla_prefill_from_bf16_workspace(
+    const torch::Tensor& q, const torch::Tensor& kv,
+    const torch::Tensor& indices, const pybind11::object& topk_length,
+    const pybind11::object& attn_sink, int head_dim_v, double softmax_scale,
+    const pybind11::object& out);
+
 void register_apis(pybind11::module& m);
 
 } // namespace sm120_mla

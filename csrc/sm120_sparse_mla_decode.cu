@@ -1436,6 +1436,119 @@ __global__ void sparse_mla_workspace_output_kernel(
         accum * gate);
 }
 
+template <typename q_t, typename kv_t, typename out_t, typename index_t>
+__global__ void sparse_mla_prefill_workspace_kernel(
+    const q_t* __restrict__ q, const kv_t* __restrict__ kv,
+    const index_t* __restrict__ indices, const void* __restrict__ topk_length,
+    int topk_length_kind, const float* __restrict__ attn_sink,
+    out_t* __restrict__ out, float* __restrict__ max_logits,
+    float* __restrict__ lse, int num_heads, int kv_tokens, int topk,
+    int64_t q_stride_t, int64_t q_stride_h, int64_t q_stride_d,
+    int64_t kv_stride_t, int64_t kv_stride_d, int64_t indices_stride_t,
+    int64_t indices_stride_k, int64_t out_stride_t, int64_t out_stride_h,
+    int64_t out_stride_d, double softmax_scale) {
+    extern __shared__ unsigned char smem[];
+    float* scores = reinterpret_cast<float*>(smem);
+    float* reduce = scores + topk;
+
+    const int token = blockIdx.x;
+    const int head = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    int limit = load_length_value(topk_length, topk_length_kind, token, topk);
+    limit = max(0, min(limit, topk));
+
+    float local_max = -INFINITY;
+    for (int k_idx = tid; k_idx < limit; k_idx += blockDim.x) {
+        const int64_t selected = load_index<index_t>(
+            indices, static_cast<int64_t>(token) * indices_stride_t +
+                         static_cast<int64_t>(k_idx) * indices_stride_k);
+        float score = -INFINITY;
+        if (selected >= 0 && selected < kv_tokens) {
+            float dot = 0.0f;
+#pragma unroll 4
+            for (int d = 0; d < kHeadDim; ++d) {
+                const float qv = load_q_value<q_t>(
+                    q, static_cast<int64_t>(token) * q_stride_t +
+                           static_cast<int64_t>(head) * q_stride_h +
+                           static_cast<int64_t>(d) * q_stride_d);
+                const float kvv = load_workspace_value<kv_t>(
+                    kv, selected * kv_stride_t +
+                            static_cast<int64_t>(d) * kv_stride_d);
+                dot += qv * kvv;
+            }
+            score = dot * static_cast<float>(softmax_scale);
+        }
+        scores[k_idx] = score;
+        local_max = fmaxf(local_max, score);
+    }
+
+    reduce[tid] = local_max;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride)
+            reduce[tid] = fmaxf(reduce[tid], reduce[tid + stride]);
+        __syncthreads();
+    }
+    const float row_max = reduce[0];
+
+    float local_sum = 0.0f;
+    if (isfinite(row_max)) {
+        for (int k_idx = tid; k_idx < limit; k_idx += blockDim.x) {
+            const float p = isfinite(scores[k_idx])
+                                ? expf(scores[k_idx] - row_max)
+                                : 0.0f;
+            scores[k_idx] = p;
+            local_sum += p;
+        }
+    }
+    reduce[tid] = local_sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride)
+            reduce[tid] += reduce[tid + stride];
+        __syncthreads();
+    }
+
+    const float denom = reduce[0];
+    const float row_lse = denom > 0.0f ? logf(denom) + row_max : -INFINITY;
+    const float inv_denom = denom > 0.0f ? 1.0f / denom : 0.0f;
+    const float sink = attn_sink == nullptr ? 0.0f : attn_sink[head];
+    const float gate =
+        attn_sink == nullptr ? 1.0f : 1.0f / (1.0f + expf(-(row_lse - sink)));
+
+    for (int d = tid; d < kHeadDim; d += blockDim.x) {
+        float accum = 0.0f;
+        if (denom > 0.0f) {
+            for (int k_idx = 0; k_idx < limit; ++k_idx) {
+                const float p = scores[k_idx] * inv_denom;
+                if (p == 0.0f)
+                    continue;
+                const int64_t selected = load_index<index_t>(
+                    indices, static_cast<int64_t>(token) * indices_stride_t +
+                                 static_cast<int64_t>(k_idx) *
+                                     indices_stride_k);
+                if (selected >= 0 && selected < kv_tokens) {
+                    accum += p * load_workspace_value<kv_t>(
+                                     kv, selected * kv_stride_t +
+                                             static_cast<int64_t>(d) *
+                                                 kv_stride_d);
+                }
+            }
+        }
+        store_out_value<out_t>(
+            out, static_cast<int64_t>(token) * out_stride_t +
+                     static_cast<int64_t>(head) * out_stride_h +
+                     static_cast<int64_t>(d) * out_stride_d,
+            accum * gate);
+    }
+
+    if (tid == 0) {
+        max_logits[static_cast<int64_t>(token) * num_heads + head] = row_max;
+        lse[static_cast<int64_t>(token) * num_heads + head] = row_lse;
+    }
+}
+
 bool is_none(const pybind11::object& obj) {
     return obj.is_none();
 }
@@ -2404,6 +2517,128 @@ std::tuple<torch::Tensor, torch::Tensor> sparse_mla_decode_full_context(
     return std::make_tuple(out, lse);
 }
 
+template <typename q_t, typename kv_t, typename out_t, typename index_t>
+void launch_sparse_mla_prefill_from_workspace(
+    const torch::Tensor& q, const torch::Tensor& kv,
+    const torch::Tensor& indices, const torch::Tensor& topk_length,
+    const torch::Tensor& attn_sink, const torch::Tensor& out,
+    const torch::Tensor& max_logits, const torch::Tensor& lse,
+    double softmax_scale) {
+    const int num_tokens = static_cast<int>(q.size(0));
+    const int num_heads = static_cast<int>(q.size(1));
+    const int active_heads = sm120_active_heads(num_heads);
+    const int kv_tokens = static_cast<int>(kv.size(0));
+    const int topk = static_cast<int>(indices.size(2));
+    const int topk_kind = length_tensor_kind(topk_length);
+    const void* topk_ptr =
+        topk_length.defined() ? topk_length.data_ptr() : nullptr;
+    const float* sink_ptr =
+        attn_sink.defined() ? attn_sink.data_ptr<float>() : nullptr;
+    const auto stream = at::cuda::getCurrentCUDAStream();
+    const dim3 grid(num_tokens, active_heads);
+    const size_t shared_bytes =
+        (static_cast<size_t>(topk) + kThreads) * sizeof(float);
+
+    DG_CUDA_RUNTIME_CHECK(cudaFuncSetAttribute(
+        sparse_mla_prefill_workspace_kernel<q_t, kv_t, out_t, index_t>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(shared_bytes)));
+    sparse_mla_prefill_workspace_kernel<q_t, kv_t, out_t, index_t>
+        <<<grid, kThreads, shared_bytes, stream>>>(
+            reinterpret_cast<const q_t*>(q.data_ptr()),
+            reinterpret_cast<const kv_t*>(kv.data_ptr()),
+            reinterpret_cast<const index_t*>(indices.data_ptr()), topk_ptr,
+            topk_kind, sink_ptr, reinterpret_cast<out_t*>(out.data_ptr()),
+            max_logits.data_ptr<float>(), lse.data_ptr<float>(), num_heads,
+            kv_tokens, topk, q.stride(0), q.stride(1), q.stride(2),
+            kv.stride(0), kv.stride(2), indices.stride(0), indices.stride(2),
+            out.stride(0), out.stride(1), out.stride(2), softmax_scale);
+    DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+sparse_mla_prefill_from_bf16_workspace(
+    const torch::Tensor& q, const torch::Tensor& kv,
+    const torch::Tensor& indices, const pybind11::object& topk_length_obj,
+    const pybind11::object& attn_sink_obj, int head_dim_v, double softmax_scale,
+    const pybind11::object& out_obj) {
+    DG_HOST_ASSERT(q.is_cuda() && kv.is_cuda() && indices.is_cuda());
+    DG_HOST_ASSERT(q.dim() == 3 && q.size(2) == kHeadDim);
+    DG_HOST_ASSERT(kv.dim() == 3 && kv.size(1) == 1 && kv.size(2) >= kHeadDim);
+    DG_HOST_ASSERT(indices.dim() == 3 && indices.size(0) == q.size(0) &&
+                   indices.size(1) == 1);
+    DG_HOST_ASSERT(head_dim_v == kHeadDim);
+
+    auto topk_length = tensor_or_empty(topk_length_obj);
+    auto attn_sink = tensor_or_empty(attn_sink_obj);
+    if (topk_length.defined()) {
+        DG_HOST_ASSERT(topk_length.is_cuda() && topk_length.numel() >= q.size(0));
+        DG_HOST_ASSERT(topk_length.scalar_type() == torch::kInt ||
+                       topk_length.scalar_type() == torch::kInt64);
+    }
+    if (attn_sink.defined() && attn_sink.scalar_type() != torch::kFloat32)
+        attn_sink = attn_sink.to(torch::kFloat32);
+
+    torch::Tensor out;
+    if (is_none(out_obj)) {
+        out = torch::empty({q.size(0), q.size(1), head_dim_v}, q.options());
+    } else {
+        out = out_obj.cast<torch::Tensor>();
+    }
+    auto max_logits =
+        torch::empty({q.size(0), q.size(1)}, q.options().dtype(torch::kFloat32));
+    auto lse =
+        torch::empty({q.size(0), q.size(1)}, q.options().dtype(torch::kFloat32));
+
+    const auto stream = at::cuda::getCurrentCUDAStream();
+    static sm120_profile::KernelProfileCounter profile_counter(
+        "sm120_sparse_mla_prefill_workspace");
+    sm120_profile::ScopedTimer profile_timer(
+        profile_counter, stream, static_cast<int>(q.size(0)),
+        static_cast<int>(q.size(1)), static_cast<int>(indices.size(2)), 1);
+
+    if (q.scalar_type() == torch::kBFloat16 &&
+        kv.scalar_type() == torch::kBFloat16 &&
+        out.scalar_type() == torch::kBFloat16) {
+        if (indices.scalar_type() == torch::kInt64) {
+            launch_sparse_mla_prefill_from_workspace<__nv_bfloat16,
+                                                     __nv_bfloat16,
+                                                     __nv_bfloat16, int64_t>(
+                q, kv, indices, topk_length, attn_sink, out, max_logits, lse,
+                softmax_scale);
+        } else if (indices.scalar_type() == torch::kInt32) {
+            launch_sparse_mla_prefill_from_workspace<__nv_bfloat16,
+                                                     __nv_bfloat16,
+                                                     __nv_bfloat16, int32_t>(
+                q, kv, indices, topk_length, attn_sink, out, max_logits, lse,
+                softmax_scale);
+        } else {
+            DG_HOST_UNREACHABLE(
+                "SM120 sparse MLA prefill indices must be int32 or int64");
+        }
+    } else if (q.scalar_type() == torch::kFloat16 &&
+               kv.scalar_type() == torch::kFloat16 &&
+               out.scalar_type() == torch::kFloat16) {
+        if (indices.scalar_type() == torch::kInt64) {
+            launch_sparse_mla_prefill_from_workspace<half, half, half, int64_t>(
+                q, kv, indices, topk_length, attn_sink, out, max_logits, lse,
+                softmax_scale);
+        } else if (indices.scalar_type() == torch::kInt32) {
+            launch_sparse_mla_prefill_from_workspace<half, half, half, int32_t>(
+                q, kv, indices, topk_length, attn_sink, out, max_logits, lse,
+                softmax_scale);
+        } else {
+            DG_HOST_UNREACHABLE(
+                "SM120 sparse MLA prefill indices must be int32 or int64");
+        }
+    } else {
+        DG_HOST_UNREACHABLE(
+            "SM120 sparse MLA prefill currently supports bf16 or fp16 q/kv/out");
+    }
+
+    return std::make_tuple(out, max_logits, lse);
+}
+
 void register_apis(pybind11::module& m) {
     m.def("sm120_sparse_mla_decode", &sparse_mla_decode,
           "SM120 sparse MLA decode for DeepSeek-V4 Flash");
@@ -2423,6 +2658,9 @@ void register_apis(pybind11::module& m) {
     m.def("sm120_sparse_mla_decode_from_bf16_workspace_split",
           &sparse_mla_decode_from_bf16_workspace_split,
           "SM120 split sparse MLA decode from gathered BF16/FP16 KV workspace");
+    m.def("sm120_sparse_mla_prefill_from_bf16_workspace",
+          &sparse_mla_prefill_from_bf16_workspace,
+          "SM120 sparse MLA prefill from gathered BF16/FP16 KV workspace");
     m.def("sm120_fill_decode_all_indices", &fill_decode_all_indices,
           "SM120 fill full-context sparse decode indices");
 }
