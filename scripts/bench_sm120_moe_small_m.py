@@ -8,10 +8,12 @@ import torch
 import deep_gemm
 
 
-def make_case(m: int, n: int, k: int, groups: int, device: str):
+def make_case(m: int, n: int, k: int, groups: int, device: str, active_groups: int | None = None):
     assert k % 128 == 0
     assert n % 128 == 0
-    assert m <= groups
+    if active_groups is None:
+        active_groups = min(m, groups)
+    assert 0 < active_groups <= groups
 
     torch.manual_seed(1234)
     a_f32 = torch.randn((m, k), device=device, dtype=torch.float32) * 0.25
@@ -27,11 +29,18 @@ def make_case(m: int, n: int, k: int, groups: int, device: str):
     sfb_raw = torch.full((groups, n, k // 32), 0x7F, device=device, dtype=torch.uint8)
     sfb = deep_gemm._C.sm120_prepack_fp8_fp4_sfb(sfb_raw, 128, n, k)
 
-    grouped_layout = torch.arange(m, device=device, dtype=torch.int32)
+    grouped_layout = torch.full((m,), -1, device=device, dtype=torch.int32)
     starts = torch.zeros((groups,), device=device, dtype=torch.int32)
     counts = torch.zeros((groups,), device=device, dtype=torch.int32)
-    starts[:m] = torch.arange(m, device=device, dtype=torch.int32)
-    counts[:m] = 1
+    base = m // active_groups
+    rem = m % active_groups
+    offset = 0
+    for group in range(active_groups):
+        count = base + (1 if group < rem else 0)
+        grouped_layout[offset:offset + count] = group
+        starts[group] = offset
+        counts[group] = count
+        offset += count
 
     return a, sfa, b, sfb, grouped_layout, starts, counts
 
@@ -55,7 +64,10 @@ def set_mode(mode: str) -> None:
     os.environ.pop("DG_SM120_MOE_SKIP_SFA_FILL", None)
     os.environ.pop("DG_SM120_MOE_ROW_GROUPED", None)
     os.environ.pop("DG_SM120_MOE_ROW_GROUPED_SKIP_SFA_FILL", None)
-    if mode == "small_m":
+    os.environ.pop("DG_SM120_MOE_DIRECT_GROUPS_WHEN_NO_SHRINK", None)
+    if mode == "direct_groups":
+        os.environ["DG_SM120_MOE_DIRECT_GROUPS_WHEN_NO_SHRINK"] = "1"
+    elif mode == "small_m":
         os.environ["DG_SM120_ENABLE_SMALL_M_MMA"] = "1"
     elif mode == "skip_fill":
         os.environ["DG_SM120_MOE_SKIP_SFA_FILL"] = "1"
@@ -93,11 +105,12 @@ def main() -> None:
     parser.add_argument(
         "--modes",
         default="default,skip_fill,small_m,row_grouped,row_grouped_skip_fill",
-        help="Comma-separated modes: default, skip_fill, small_m, row_grouped, row_grouped_skip_fill",
+        help="Comma-separated modes: default, direct_groups, skip_fill, small_m, row_grouped, row_grouped_skip_fill",
     )
+    parser.add_argument("--active-groups", type=int, default=None)
     args = parser.parse_args()
 
-    case = make_case(args.m, args.n, args.k, args.groups, args.device)
+    case = make_case(args.m, args.n, args.k, args.groups, args.device, args.active_groups)
     modes = [x for x in args.modes.split(",") if x]
     outputs = {
         mode: torch.empty((args.m, args.n), device=args.device, dtype=torch.bfloat16)

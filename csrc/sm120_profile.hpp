@@ -73,6 +73,19 @@ public:
           groups_(groups), active_(enabled()) {
         if (!active_)
             return;
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        const cudaError_t capture_error =
+            cudaStreamIsCapturing(stream_, &capture_status);
+        if (capture_error == cudaSuccess &&
+            capture_status != cudaStreamCaptureStatusNone) {
+            active_ = false;
+            return;
+        }
+        if (capture_error != cudaSuccess) {
+            cudaGetLastError();
+            active_ = false;
+            return;
+        }
         if (cudaEventCreate(&start_) != cudaSuccess ||
             cudaEventCreate(&stop_) != cudaSuccess) {
             active_ = false;

@@ -39,7 +39,9 @@ __global__ void silu_mul_quant_fp8_packed_kernel(
     int mn,
     int hidden,
     int tma_aligned_mn,
-    int num_scale_elems) {
+    int num_scale_elems,
+    float clamp_limit,
+    bool has_clamp) {
     extern __shared__ float smem[];
 
     const int local_group = threadIdx.y;
@@ -62,9 +64,14 @@ __global__ void silu_mul_quant_fp8_packed_kernel(
             input + static_cast<int64_t>(mn_idx) * 2 * hidden + col_base;
         const __nv_bfloat16* up = gate + hidden;
         for (int i = local_tid; i < group_size; i += blockDim.x) {
-            const float gate_v = __bfloat162float(gate[i]);
-            const __nv_bfloat16 silu_bf16 = __float2bfloat16_rn(silu(gate_v));
-            const float value = __bfloat162float(__hmul(silu_bf16, up[i]));
+            float gate_v = __bfloat162float(gate[i]);
+            float up_v = __bfloat162float(up[i]);
+            if (has_clamp) {
+                gate_v = fminf(gate_v, clamp_limit);
+                up_v = fminf(fmaxf(up_v, -clamp_limit), clamp_limit);
+            }
+            const float value = __bfloat162float(
+                __float2bfloat16_rn(silu(gate_v) * up_v));
             values[i] = value;
             local_absmax = fmaxf(local_absmax, fabsf(value));
         }
@@ -118,7 +125,8 @@ int groups_per_block_for(int64_t num_groups) {
 
 torch::Tensor sm120_silu_mul_quant_fp8_packed(const torch::Tensor& input,
                                               const torch::Tensor& output,
-                                              int64_t group_size) {
+                                              int64_t group_size,
+                                              double clamp_limit) {
     DG_HOST_ASSERT(input.is_cuda());
     DG_HOST_ASSERT(output.is_cuda());
     DG_HOST_ASSERT(input.scalar_type() == torch::kBFloat16);
@@ -169,7 +177,9 @@ torch::Tensor sm120_silu_mul_quant_fp8_packed(const torch::Tensor& input,
         static_cast<int>(mn),
         static_cast<int>(hidden),
         static_cast<int>(tma_aligned_mn),
-        static_cast<int>(num_scale_elems));
+        static_cast<int>(num_scale_elems),
+        static_cast<float>(clamp_limit),
+        clamp_limit > 0.0);
     return scales;
 }
 
@@ -177,7 +187,8 @@ void register_apis(pybind11::module& m) {
     m.def("sm120_silu_mul_quant_fp8_packed",
           &sm120_silu_mul_quant_fp8_packed,
           pybind11::arg("input"), pybind11::arg("output"),
-          pybind11::arg("group_size"));
+          pybind11::arg("group_size"),
+          pybind11::arg("clamp_limit") = 0.0);
 }
 
 }  // namespace deep_gemm::sm120_moe

@@ -28,18 +28,22 @@ Blackwell workstation GPUs, which report compute capability SM120.
 - `VLLM_KV_CACHE_MEMORY_BYTES=8589934592`
 - `VLLM_MAX_NUM_BATCHED_TOKENS=4096`
 - `VLLM_MAX_NUM_SEQS=4`
-- `VLLM_MAX_CUDAGRAPH_CAPTURE_SIZE=4`
+- `VLLM_MAX_CUDAGRAPH_CAPTURE_SIZE=8`
 - `VLLM_PERFORMANCE_MODE=balanced`
 - `VLLM_OPTIMIZATION_LEVEL=2`
 - `DG_SM120_ACTIVE_HEADS=32`
 - `DG_SM120_SEQUENTIAL_COMPRESSOR=1`
 - `DG_SM120_ENABLE_B12X_MOE=0`
 - `DG_SM120_PREFILL_WORKSPACE_CHUNK=16`
+- `DG_SM120_PREFILL_INDEXED_SPLIT=0`
+- `DG_SM120_PREFILL_GATHER_WORKSPACE=0`
 - `DG_SM120_MOE_SKIP_SFA_FILL=1`
 - `DG_SM120_MOE_SKIP_SFA_FILL_MAX_M=16`
 - `DG_SM120_MOE_ROW_GROUPED=1`
 - `DG_SM120_MOE_ROW_GROUPED_MAX_M=16`
 - `DG_SM120_MOE_ROW_GROUPED_SKIP_SFA_FILL=1`
+- `DG_SM120_CACHE_FP8_SFB=1`
+- default speculative config: `docker/vllm_speculative_mtp1_local_argmax.json` (`num_speculative_tokens=1`, local argmax reduction)
 - `DG_SM120_BYPASS_TP_ALLREDUCE=0`
 - `DG_SM120_MHC_REUSE_BUFFERS=0`
 
@@ -94,6 +98,7 @@ Important implemented paths:
 - SM120 C128 FP8 decode/projection support sufficient for functional serving.
 - SM120 FP8 `bhr,hdr->bhd` einsum path for the DeepSeek V4 output projection.
 - SM120 sparse MLA decode kernels, including BF16 workspace variants.
+- SM120 FP8xFP8 dense CUTLASS path now caches static SFB/weight scale layouts per weight tensor and shape behind `DG_SM120_CACHE_FP8_SFB=1`, avoiding repeated SFB fill/convert launches for reused C128/decode weights.
 - SM120 BHR `bhr,hdr->bhd` dispatch now uses the warp-column path for
   decode-sized shapes (`R <= 512`, `D <= 2048`, `B*H <= 64`) as well as longer
   contexts.
@@ -115,6 +120,14 @@ Important implemented paths:
   - builds a bounded BF16 workspace per chunk
   - calls `sm120_sparse_mla_decode_from_bf16_workspace_split`
   - avoids allocating one huge gathered workspace for long prompts
+- Experimental SM120 direct-indexed sparse prefill exists behind
+  `DG_SM120_PREFILL_INDEXED_SPLIT=1`. It is correct in synthetic tests but
+  slower than the current chunked workspace path, so keep it disabled by
+  default.
+- Experimental SM120 C++ BF16/FP16 workspace gather exists behind
+  `DG_SM120_PREFILL_GATHER_WORKSPACE=1`. It is correct but was slightly slower
+  than PyTorch advanced-index gather in synthetic tests, so keep it disabled by
+  default unless testing allocator/memory behavior.
 
 ### Bench and Utility Scripts
 
@@ -138,9 +151,20 @@ Useful scripts include:
   - `--kv-cache-memory-bytes 8589934592`
 - CUDA graph capture works with the current non-eager configuration.
 - Parallel serving works better than single-request serving:
-  - recent 512-token decode tests reached roughly `145 tok/s` aggregate at
-    concurrency `4`
-  - single request remained around `66-67 tok/s` after warmup
+  - warmed MTP/local-argmax c4 256-token decode reached roughly `176 tok/s` aggregate steady decode
+  - warmed single-request MTP/local-argmax 512-token decode is roughly `85-86 tok/s` steady decode
+
+- MTP speculative decode with local argmax reduction is now the default serving path:
+  - config file: `docker/vllm_speculative_mtp1_local_argmax.json`
+  - `num_speculative_tokens=1` with local argmax keeps c1 around `85-86 tok/s` while improving warmed c4 aggregate decode to about `176 tok/s`.
+  - `num_speculative_tokens=2` reached about `92 tok/s` c1 after warmup but regressed c4 aggregate to about `115 tok/s`, so it is not the balanced default.
+- FP8xFP8 SFB scale caching is correct and improves targeted dense FP8 microbenchmarks:
+  - `m=4,n=1536,k=4096`: `36.926 us` -> `32.808 us`
+  - `m=4,n=4096,k=4096`: `38.939 us` -> `32.823 us`
+  - `m=8,n=4096,k=4096`: `38.938 us` -> `32.810 us`
+  - `m=8,n=16384,k=1024`: `30.740 us` -> `22.580 us`
+  - cache on/off was bit-exact for the validated UE8M0 scale case.
+  - end-to-end c1 only moved slightly (`~86 tok/s`), so this removes wasted repeated work but is not the missing architectural 100+ tok/s lever.
 - C128 FP8 M=1 projection microbenchmarks improved substantially after the
   contiguous UE8M0 k-block specialization:
   - example projection shapes improved from roughly `18-25 us` to `14-18 us`
@@ -164,6 +188,11 @@ Useful scripts include:
     about `2.85 ms`
   - `S=128,H=64,K=2048`: native about `17.4 ms`, workspace split plus gather
     about `6.3 ms`
+- The direct-indexed split sparse prefill path is correct but not faster:
+  - `S=16,H=32,K=2048`: native about `2.90 ms`, direct indexed split about
+    `704 us`, chunked workspace about `431 us`
+  - `S=128,H=32,K=2048`: native about `14.9 ms`, direct indexed split about
+    `7.46 ms`, chunked workspace about `4.85 ms`
 - Long decode length alone is not the main problem:
   - small-prompt completions from `128` to `1024` output tokens stayed around
     `58-65 tok/s`
@@ -206,6 +235,12 @@ Useful scripts include:
     dominate enough that live TTFT only improved modestly
   - a full-size gathered workspace for long prompts would be too large, so the
     path must stay subchunked unless memory use is redesigned
+- The C++ reusable workspace gather did not beat PyTorch gather in synthetic
+  prefill tests:
+  - `S=16,H=32,K=2048`: chunked workspace about `431 us`, C++ gather plus
+    chunked workspace about `443 us`
+  - Keep `DG_SM120_PREFILL_GATHER_WORKSPACE=0` unless profiling allocator churn
+    or memory-pressure behavior specifically.
 - The subchunked workspace path improved TTFT only modestly in the live server:
   - around `4.1k` prompt tokens: `13.2s` TTFT -> `11.3s`
   - around `8.2k` prompt tokens: `28.7s` TTFT -> `24.3s`
@@ -271,8 +306,9 @@ The second likely bottleneck is sparse MLA decode and MoE decode efficiency.
 The current implementation still contains fallback/workspace-heavy paths that
 are functional but not production-grade.
 
-For the measured single-request decode path, the dominant remaining MoE target
-is the tiny-M SM120 FP8xFP4 routed expert GEMM body. The setup overhead has
+For the measured single-request decode path, the dominant remaining targets
+are the tiny-M SM120 FP8xFP4 routed expert GEMM body, the dense FP8xFP8
+C128/decode GEMM body, and per-layer fixed overhead. The setup overhead has
 been reduced and bounded:
 
 - `row_grouped_skip_fill` removes the compact init/fill setup launches for
@@ -315,6 +351,44 @@ been reduced and bounded:
     realistic `m=6` shapes and was removed.
 - Added `VLLM_PROFILER_CONFIG_JSON` compose plumbing for quoted profiler config.
   This was added after an unquoted profiler restart broke startup.
+- Added `DG_SM120_PREFILL_INDEXED_SPLIT` and
+  `DG_SM120_PREFILL_GATHER_WORKSPACE` as default-off experimental prefill
+  switches.
+- Added a direct-indexed sparse prefill split API and a reusable BF16/FP16
+  workspace gather API. Both are correct synthetically, but neither is a
+  default speed win over the current chunked workspace path.
+- Added `cuda-nsight-compute-13-0` to the development container and a targeted
+  `scripts/run_ncu_sm120_moe.sh` runner. Nsight Compute currently launches but
+  host GPU performance counters are blocked by `ERR_NVGPUCTRPERM`; fix host
+  counter permissions before relying on NCU metrics.
+
+
+- Added default MTP speculative serving config (`docker/vllm_speculative_mtp1_local_argmax.json`) and changed compose's default CUDA graph capture size to `8`. This is the best balanced config found so far: c1 improves from the non-MTP `~69-70 tok/s` range to `~85-86 tok/s`, while warmed c4 aggregate steady decode is about `176 tok/s`.
+- Added DeepSeek V4 MTP local-argmax patching in `docker/patch_vllm_deepseekv4.py` so draft token selection avoids full-vocab all-gather. Patching only generic `deepseek_mtp.py` failed; the working path patches `deepseek_v4_mtp.py` as well.
+- Added SM120 FP8xFP8 static SFB scale-layout caching in `csrc/sm120_fp8_fp8_cutlass.cu`. Microbenchmarks improved selected dense FP8 small-M shapes by roughly `1.13x-1.36x`; end-to-end c1 remained below target.
+- Tested and rejected MTP `num_speculative_tokens=2`/capture-size `16` as a default: warm c1 reached about `92 tok/s`, but c4 aggregate steady decode regressed to about `115 tok/s`.
+- Tested and rejected MTP `num_speculative_tokens=3`: c1 steady decode dropped to about `77-81 tok/s`.
+- Re-tested the restored default service after the latest rebuild:
+  - correctness request returned `OK.`
+  - c1 512-token decode: about `85.5 request tok/s`, `87.8 steady tok/s`
+  - c4 256-token decode remains valid but varies by run; recent aggregate
+    steady measurements were roughly `140-146 tok/s`
+- Tested and rejected a dense FP8xFP8 per-row small-M MMA path for broad
+  decode-sized `m=2/4/8` shapes. It compiled and was correct, but regressed
+  badly versus the current CUTLASS path; examples:
+  - `m=2,n=1536,k=4096`: default `30.868 us`, small-M MMA `81.940 us`
+  - `m=2,n=16384,k=1024`: default `20.592 us`, small-M MMA `50.057 us`
+  The prototype was removed; do not re-add a one-row-per-MMA dense C128 path
+  without a new design that fixes the occupancy/register-use problem.
+- Tested and rejected additional runtime/config knobs as defaults:
+  - `DG_SM120_PREFILL_WORKSPACE_CHUNK=64` worsened a 516-token prompt TTFT to
+    about `4.99s` and hurt c1 decode in that run; keep chunk `16`.
+  - `VLLM_MAX_NUM_BATCHED_TOKENS=6144` with MTP2 failed startup with
+    `CUDA_ERROR_ILLEGAL_ADDRESS`; keep `4096`.
+  - MTP2 plus `DG_SM120_MAIN_TOPK_CAP=64` did not improve c1 and regressed c4;
+    keep MTP1 plus top-k cap `128`.
+  - `DG_SM120_SEQUENTIAL_COMPRESSOR=0` was correct but did not improve TTFT or
+    decode; keep it enabled for stability.
 
 Latest MoE microbench results from one-off CUDA 13 container rebuilds:
 
@@ -331,6 +405,12 @@ Latest MoE microbench results from one-off CUDA 13 container rebuilds:
 - `m=24,n=4096,k=2048`: default `99.072 us`,
   `row_grouped_skip_fill` `100.077 us`, bit-exact, slight regression. Keep the
   max-M guard enabled.
+- Rechecked after the Ralph build restore:
+  - `m=6,n=4096,k=4096`: `row_grouped_skip_fill` about `63.6 us`
+  - `m=6,n=4096,k=2048`: `row_grouped_skip_fill` about `37.6-38.2 us`
+  - Limiting CUTLASS `hw_info.sm_count` to b12x-like active-cluster values
+    (`48,64,84,107,127,148`) did not improve these shapes and often regressed,
+    so no SM-count override is kept.
 
 ## Next Work
 

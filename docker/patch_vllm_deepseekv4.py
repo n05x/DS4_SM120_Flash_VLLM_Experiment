@@ -759,17 +759,95 @@ def patch_flashmla_sparse_prefill() -> None:
             "sm120_sparse_mla_decode_from_bf16_workspace_split",
             None,
         )
+        workspace_gather = getattr(
+            getattr(deep_gemm, "_C", None),
+            "sm120_gather_bf16_workspace",
+            None,
+        )
+        indexed_prefill_split = getattr(
+            getattr(deep_gemm, "_C", None),
+            "sm120_sparse_mla_prefill_from_bf16_workspace_split",
+            None,
+        )
         chunk_size = int(os.environ.get("DG_SM120_PREFILL_WORKSPACE_CHUNK", "16"))
-        if workspace_decode is not None and chunk_size > 0:
-            kv_2d = kv[:, 0, :]
+        if (
+            os.environ.get("DG_SM120_PREFILL_INDEXED_SPLIT", "0") == "1"
+            and indexed_prefill_split is not None
+            and chunk_size > 0
+        ):
             lse = torch.empty((q.shape[0], q.shape[1]), device=q.device,
                               dtype=torch.float32)
             max_logits = torch.empty_like(lse)
             for start in range(0, q.shape[0], chunk_size):
                 end = min(start + chunk_size, q.shape[0])
-                idx = indices[start:end, 0, :].to(torch.long)
-                idx = idx.clamp(0, kv_2d.shape[0] - 1)
-                workspace = kv_2d[idx]
+                chunk_topk = None
+                if topk_length is not None:
+                    chunk_topk = topk_length[start:end]
+                _chunk_out, _chunk_max, chunk_lse = indexed_prefill_split(
+                    q[start:end],
+                    kv,
+                    indices[start:end],
+                    chunk_topk,
+                    attn_sink,
+                    d_v,
+                    sm_scale,
+                    out[start:end],
+                )
+                lse[start:end].copy_(chunk_lse)
+            max_logits.fill_(float("nan"))
+            return out, max_logits, lse
+
+        if workspace_decode is not None and chunk_size > 0:
+            kv_2d = kv[:, 0, :]
+            lse = torch.empty((q.shape[0], q.shape[1]), device=q.device,
+                              dtype=torch.float32)
+            max_logits = torch.empty_like(lse)
+            gather_enabled = (
+                os.environ.get("DG_SM120_PREFILL_GATHER_WORKSPACE", "0") == "1"
+                and workspace_gather is not None
+                and indices.is_contiguous()
+                and kv_2d.is_contiguous()
+            )
+            workspace_cache = getattr(
+                _sm120_flash_mla_sparse_prefill_fwd,
+                "_dg_sm120_workspace_cache",
+                {},
+            )
+            for start in range(0, q.shape[0], chunk_size):
+                end = min(start + chunk_size, q.shape[0])
+                if gather_enabled:
+                    rows = end - start
+                    topk = indices.shape[-1]
+                    key = (
+                        q.device.index,
+                        str(kv_2d.dtype),
+                        chunk_size,
+                        topk,
+                        kv_2d.shape[-1],
+                    )
+                    workspace = workspace_cache.get(key)
+                    if workspace is None or workspace.shape != (
+                        chunk_size,
+                        topk,
+                        kv_2d.shape[-1],
+                    ):
+                        workspace = torch.empty(
+                            (chunk_size, topk, kv_2d.shape[-1]),
+                            device=q.device,
+                            dtype=kv_2d.dtype,
+                        )
+                        workspace_cache[key] = workspace
+                        setattr(
+                            _sm120_flash_mla_sparse_prefill_fwd,
+                            "_dg_sm120_workspace_cache",
+                            workspace_cache,
+                        )
+                    workspace = workspace[:rows]
+                    workspace_gather(kv_2d, indices[start:end, 0, :], workspace)
+                else:
+                    idx = indices[start:end, 0, :].to(torch.long)
+                    idx = idx.clamp(0, kv_2d.shape[0] - 1)
+                    workspace = kv_2d[idx]
                 chunk_topk = None
                 if topk_length is not None:
                     chunk_topk = topk_length[start:end]
@@ -854,7 +932,10 @@ def patch_flashmla_sparse_prefill() -> None:
 
     if (
         "def _sm120_flash_mla_sparse_prefill_fwd" in source
-        and "DG_SM120_PREFILL_WORKSPACE_CHUNK" not in source
+        and (
+            "DG_SM120_PREFILL_WORKSPACE_CHUNK" not in source
+            or "sm120_sparse_mla_prefill_from_bf16_workspace_split" not in source
+        )
     ):
         source = re.sub(
             r"def _sm120_flash_mla_sparse_prefill_fwd\(.*?\n\ndef flash_mla_sparse_fwd\(",
@@ -2359,6 +2440,14 @@ def patch_deepseek_v4_layer_profiler() -> None:
     )
     source = path.read_text()
     if "DG_SM120_PROFILE_LAYER" in source:
+        old_guard = "        if not _DG_SM120_PROFILE_LAYER_ENABLED:\n"
+        new_guard = """        if (
+            not _DG_SM120_PROFILE_LAYER_ENABLED
+            or torch.cuda.is_current_stream_capturing()
+        ):
+"""
+        if old_guard in source and "is_current_stream_capturing()" not in source:
+            path.write_text(source.replace(old_guard, new_guard, 1))
         return
     old = '''    def forward(
         self,
@@ -2389,7 +2478,10 @@ def patch_deepseek_v4_layer_profiler() -> None:
         positions: torch.Tensor,
         input_ids: torch.Tensor | None,
     ) -> torch.Tensor:
-        if __import__("os").environ.get("DG_SM120_PROFILE_LAYER", "0") != "1":
+        if (
+            not _DG_SM120_PROFILE_LAYER_ENABLED
+            or torch.cuda.is_current_stream_capturing()
+        ):
             residual = x
             x, post, comb = self.hc_pre(
                 x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
@@ -2457,8 +2549,7 @@ def patch_deepseek_v4_layer_profiler() -> None:
         x = timed("hc_ffn_post", lambda: self.hc_post(x, residual, post, comb))
 
         prof["calls"] += 1
-        every = int(os.environ.get("DG_SM120_PROFILE_EVERY", "2048"))
-        if prof["calls"] % every == 0:
+        if prof["calls"] % _DG_SM120_PROFILE_EVERY == 0:
             keys = [k for k in prof.keys() if k != "calls"]
             total = sum(prof[k] for k in keys)
             line = (
@@ -2466,11 +2557,32 @@ def patch_deepseek_v4_layer_profiler() -> None:
                 + " ".join(f"{k}_ms={prof[k]:.3f}" for k in keys)
                 + "\\n"
             )
-            with open("/tmp/dg_sm120_profile.txt", "a", encoding="utf-8") as f:
+            with open(_DG_SM120_PROFILE_PATH, "a", encoding="utf-8") as f:
                 f.write(line)
                 f.flush()
         return x
 '''
+    profile_globals = '''
+_DG_SM120_PROFILE_OS = __import__("os")
+_DG_SM120_PROFILE_LAYER_ENABLED = (
+    _DG_SM120_PROFILE_OS.environ.get("DG_SM120_PROFILE_LAYER", "0") == "1"
+)
+_DG_SM120_PROFILE_EVERY = int(
+    _DG_SM120_PROFILE_OS.environ.get("DG_SM120_PROFILE_EVERY", "2048")
+)
+_DG_SM120_PROFILE_PATH = _DG_SM120_PROFILE_OS.environ.get(
+    "DG_SM120_PROFILE_PATH", "/tmp/dg_sm120_profile.txt"
+)
+'''
+    if "_DG_SM120_PROFILE_LAYER_ENABLED" not in source:
+        if "logger = init_logger(__name__)\n" in source:
+            source = source.replace(
+                "logger = init_logger(__name__)\n",
+                "logger = init_logger(__name__)\n" + profile_globals + "\n",
+                1,
+            )
+        else:
+            source = profile_globals + "\n" + source
     if old not in source:
         raise RuntimeError(f"Could not patch DeepSeek V4 layer profiler in {path}")
     path.write_text(source.replace(old, new, 1))
@@ -2862,6 +2974,64 @@ def patch_deep_gemm_moe_with_starts() -> None:
         "layers/fused_moe/experts/deep_gemm_moe.py"
     )
     source = path.read_text()
+    install_moe_profile = (
+        __import__("os").environ.get("DG_SM120_INSTALL_MOE_PROFILE_PATCH", "0") == "1"
+    )
+    profile_helper = """
+_DG_SM120_MOE_PROFILE_COUNTER = 0
+
+
+def _dg_sm120_profile_moe_shape(stage, a, w, expert_counts):
+    # Env-gated routed-shape sampling for SM120 DeepGEMM MoE calls.
+    os_mod = __import__("os")
+    if os_mod.environ.get("DG_SM120_PROFILE_MOE_SHAPES", "0") != "1":
+        return
+    if torch.cuda.is_current_stream_capturing():
+        return
+    try:
+        global _DG_SM120_MOE_PROFILE_COUNTER
+        _DG_SM120_MOE_PROFILE_COUNTER += 1
+        every = max(1, int(os_mod.environ.get("DG_SM120_PROFILE_MOE_EVERY", "1")))
+        if _DG_SM120_MOE_PROFILE_COUNTER % every != 0:
+            return
+        counts_cpu = expert_counts.detach().to("cpu", non_blocking=False)
+        active = counts_cpu[counts_cpu > 0]
+        w_shape = tuple(int(x) for x in w.shape)
+        if len(w_shape) >= 3:
+            n = w_shape[-2]
+            k_storage = w_shape[-1]
+        else:
+            n = 0
+            k_storage = 0
+        record = {
+            "call": _DG_SM120_MOE_PROFILE_COUNTER,
+            "stage": str(stage),
+            "m": int(a.shape[0]),
+            "k": int(a.shape[-1]) if a.dim() else 0,
+            "weight_shape": w_shape,
+            "n": int(n),
+            "k_storage": int(k_storage),
+            "num_experts": int(counts_cpu.numel()),
+            "active_experts": int(active.numel()),
+            "max_tokens_per_expert": int(active.max().item()) if active.numel() else 0,
+            "min_tokens_per_expert": int(active.min().item()) if active.numel() else 0,
+            "sum_tokens": int(counts_cpu.sum().item()),
+        }
+        path = os_mod.environ.get("DG_SM120_MOE_PROFILE_PATH", "/tmp/dg_sm120_moe_shapes.jsonl")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(__import__("json").dumps(record, sort_keys=True) + "\\n")
+    except Exception:
+        return
+"""
+    if install_moe_profile and "def _dg_sm120_profile_moe_shape(" not in source:
+        if "logger = init_logger(__name__)\n" in source:
+            source = source.replace(
+                "logger = init_logger(__name__)\n",
+                "logger = init_logger(__name__)\n" + profile_helper + "\n",
+                1,
+            )
+        else:
+            source = profile_helper + "\n" + source
     # The stock DeepGEMM backend allocates and processes per-expert regions
     # rounded up to 128 rows. For DeepSeek V4 decode on SM120 this inflates
     # M from M*topk (typically 6-48 rows) to roughly local_experts*128 rows,
@@ -3009,6 +3179,58 @@ def patch_deep_gemm_moe_with_starts() -> None:
 """
     if old_fp4_mm2 in source:
         source = source.replace(old_fp4_mm2, new_fp4_mm2, 1)
+
+    # If the container was already patched before this version, with-starts
+    # calls may be present without the diagnostic shape sampler. Add the sampler
+    # idempotently so enabling DG_SM120_PROFILE_MOE_SHAPES does not require a
+    # pristine vLLM install.
+    profile_call_replacements = [
+        (
+            '_dg_sm120_profile_moe_shape("fc1",',
+            '        m_grouped_fp8_gemm_nt_contiguous_with_starts(\n'
+            '            (a1q, a1q_scale),\n'
+            '            (w1, self.w1_scale),',
+            '        _dg_sm120_profile_moe_shape("fc1", a1q, w1, expert_counts)\n'
+            '        m_grouped_fp8_gemm_nt_contiguous_with_starts(\n'
+            '            (a1q, a1q_scale),\n'
+            '            (w1, self.w1_scale),',
+        ),
+        (
+            '_dg_sm120_profile_moe_shape("fc2",',
+            '        m_grouped_fp8_gemm_nt_contiguous_with_starts(\n'
+            '            (a2q, a2q_scale),\n'
+            '            (w2, self.w2_scale),',
+            '        _dg_sm120_profile_moe_shape("fc2", a2q, w2, expert_counts)\n'
+            '        m_grouped_fp8_gemm_nt_contiguous_with_starts(\n'
+            '            (a2q, a2q_scale),\n'
+            '            (w2, self.w2_scale),',
+        ),
+        (
+            '_dg_sm120_profile_moe_shape("fc1_fp4",',
+            '        m_grouped_fp8_gemm_nt_contiguous_with_starts(\n'
+            '            (a1q, a1q_scale),\n'
+            '            (w1.view(torch.int8), self.w1_scale),',
+            '        _dg_sm120_profile_moe_shape("fc1_fp4", a1q, w1, expert_counts)\n'
+            '        m_grouped_fp8_gemm_nt_contiguous_with_starts(\n'
+            '            (a1q, a1q_scale),\n'
+            '            (w1.view(torch.int8), self.w1_scale),',
+        ),
+        (
+            '_dg_sm120_profile_moe_shape("fc2_fp4",',
+            '        m_grouped_fp8_gemm_nt_contiguous_with_starts(\n'
+            '            (a2q, a2q_scale),\n'
+            '            (w2.view(torch.int8), self.w2_scale),',
+            '        _dg_sm120_profile_moe_shape("fc2_fp4", a2q, w2, expert_counts)\n'
+            '        m_grouped_fp8_gemm_nt_contiguous_with_starts(\n'
+            '            (a2q, a2q_scale),\n'
+            '            (w2.view(torch.int8), self.w2_scale),',
+        ),
+    ]
+    if install_moe_profile:
+        for marker, old_call, new_call in profile_call_replacements:
+            if marker not in source and old_call in source:
+                source = source.replace(old_call, new_call, 1)
+
     path.write_text(source)
 
 
@@ -3068,7 +3290,7 @@ def patch_deep_gemm_moe_fused_activation_quant() -> None:
                 and hasattr(deep_gemm._C, "sm120_silu_mul_quant_fp8_packed")
             ):
                 a2q_scale = deep_gemm._C.sm120_silu_mul_quant_fp8_packed(
-                    input, output, block_k
+                    input, output, block_k, 0.0
                 )
                 return output.view(M_sum, activation_out_dim), a2q_scale
 
@@ -3089,7 +3311,418 @@ def patch_deep_gemm_moe_fused_activation_quant() -> None:
             source = source.replace(old_two_step, new, 1)
         else:
             raise RuntimeError(f"Could not patch SM120 fused act+quant in {path}")
+
+    fp4_triton = """        if scale_fmt == DeepGemmQuantScaleFMT.UE8M0:
+            assert activation == MoEActivation.SILU
+            return fused_silu_mul_fp8_quant_packed(
+                input=input,
+                output_q=output,
+                group_size=block_k,
+                clamp_limit=self.gemm1_clamp_limit,
+            )
+"""
+    fp4_sm120 = """        if scale_fmt == DeepGemmQuantScaleFMT.UE8M0:
+            if (
+                activation == MoEActivation.SILU
+                and input.is_cuda
+                and input.is_contiguous()
+                and output.is_contiguous()
+                and input.dtype == torch.bfloat16
+                and output.dtype == torch.float8_e4m3fn
+                and torch.cuda.get_device_capability(input.device)[0] >= 12
+                and hasattr(deep_gemm._C, "sm120_silu_mul_quant_fp8_packed")
+            ):
+                a2q_scale = deep_gemm._C.sm120_silu_mul_quant_fp8_packed(
+                    input, output, block_k, float(self.gemm1_clamp_limit or 0.0)
+                )
+                return output.view(M_sum, activation_out_dim), a2q_scale
+
+            assert activation == MoEActivation.SILU
+            return fused_silu_mul_fp8_quant_packed(
+                input=input,
+                output_q=output,
+                group_size=block_k,
+                clamp_limit=self.gemm1_clamp_limit,
+            )
+"""
+    if fp4_triton in source:
+        source = source.replace(fp4_triton, fp4_sm120, 1)
     path.write_text(source)
+
+
+def patch_deepseek_mtp_local_argmax_reduction() -> None:
+    """Allow vLLM's spec decoder to avoid full-vocab all-gather for MTP.
+
+    The DeepSeek V4 MTP draft model shares the target lm_head in this image, but
+    upstream DeepSeekMTP does not expose ``get_top_tokens``.  When
+    ``use_local_argmax_reduction`` is enabled in the speculative config, vLLM
+    therefore falls back to gathering full vocab logits before argmax.  On TP=2
+    this is unnecessary for greedy draft-token selection: each rank can compute
+    its local argmax and all-gather only (value, index) pairs via the existing
+    LogitsProcessor helper.
+    """
+
+    path = Path(
+        "/usr/local/lib/python3.12/dist-packages/vllm/model_executor/"
+        "models/deepseek_mtp.py"
+    )
+    source = path.read_text()
+    if "def get_top_tokens(" in source:
+        source_patched = True
+    else:
+        source_patched = False
+
+    predictor_old = '''    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        current_step_idx = spec_step_idx % self.num_mtp_layers
+        mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
+        logits = self.logits_processor(
+            mtp_layer.shared_head.head, mtp_layer.shared_head(hidden_states)
+        )
+        return logits
+'''
+    predictor_new = predictor_old + '''
+    def get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        current_step_idx = spec_step_idx % self.num_mtp_layers
+        mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
+        return self.logits_processor.get_top_tokens(
+            mtp_layer.shared_head.head, mtp_layer.shared_head(hidden_states)
+        )
+'''
+    if not source_patched:
+        if predictor_old not in source:
+            raise RuntimeError(f"Could not patch DeepSeek MTP predictor local argmax in {path}")
+        source = source.replace(predictor_old, predictor_new, 1)
+
+    mtp_old = '''    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor | None:
+        return self.model.compute_logits(hidden_states, spec_step_idx)
+'''
+    mtp_new = mtp_old + '''
+    def get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        return self.model.get_top_tokens(hidden_states, spec_step_idx)
+'''
+    if not source_patched:
+        if mtp_old not in source:
+            raise RuntimeError(f"Could not patch DeepSeekMTP local argmax in {path}")
+        source = source.replace(mtp_old, mtp_new, 1)
+        path.write_text(source)
+
+    v4_path = Path(
+        "/usr/local/lib/python3.12/dist-packages/vllm/model_executor/"
+        "models/deepseek_v4_mtp.py"
+    )
+    if not v4_path.exists():
+        return
+    source = v4_path.read_text()
+    if "def get_top_tokens(" in source:
+        return
+
+    v4_predictor_old = '''    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        current_step_idx = spec_step_idx % self.num_mtp_layers
+        mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
+        # MTP forward returns the pre-hc_head residual (T, hc_mult * D); apply
+        # hc_head here so logits are computed from the dense hidden state.
+        hidden_states = hidden_states.view(
+            -1, mtp_layer.hc_mult, mtp_layer.config.hidden_size
+        )
+        hidden_states = hc_head(
+            hidden_states,
+            mtp_layer.hc_head_fn,
+            mtp_layer.hc_head_scale,
+            mtp_layer.hc_head_base,
+            mtp_layer.rms_norm_eps,
+            mtp_layer.hc_eps,
+        )
+        logits = self.logits_processor(
+            mtp_layer.shared_head.head, mtp_layer.shared_head(hidden_states)
+        )
+        return logits
+'''
+    v4_predictor_new = v4_predictor_old + '''
+    def get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        current_step_idx = spec_step_idx % self.num_mtp_layers
+        mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
+        # Match compute_logits exactly up to vocab projection, then use vLLM's
+        # vocab-parallel local argmax reduction instead of full-vocab gather.
+        hidden_states = hidden_states.view(
+            -1, mtp_layer.hc_mult, mtp_layer.config.hidden_size
+        )
+        hidden_states = hc_head(
+            hidden_states,
+            mtp_layer.hc_head_fn,
+            mtp_layer.hc_head_scale,
+            mtp_layer.hc_head_base,
+            mtp_layer.rms_norm_eps,
+            mtp_layer.hc_eps,
+        )
+        return self.logits_processor.get_top_tokens(
+            mtp_layer.shared_head.head, mtp_layer.shared_head(hidden_states)
+        )
+'''
+    if v4_predictor_old not in source:
+        raise RuntimeError(f"Could not patch DeepSeek V4 MTP predictor local argmax in {v4_path}")
+    source = source.replace(v4_predictor_old, v4_predictor_new, 1)
+
+    v4_mtp_old = '''    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor | None:
+        return self.model.compute_logits(hidden_states, spec_step_idx)
+'''
+    v4_mtp_new = v4_mtp_old + '''
+    def get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        return self.model.get_top_tokens(hidden_states, spec_step_idx)
+'''
+    if v4_mtp_old not in source:
+        raise RuntimeError(f"Could not patch DeepSeekV4MTP local argmax in {v4_path}")
+    source = source.replace(v4_mtp_old, v4_mtp_new, 1)
+    v4_path.write_text(source)
+
+
+def patch_deepseek_v4_greedy_spec_argmax_fastpath() -> None:
+    """Avoid full-vocab target-logit materialization for safe greedy MTP decode.
+
+    vLLM's stock rejection sampler always computes and gathers full target
+    logits for both draft-verification positions and bonus-token positions.  In
+    the common greedy/no-logprobs path, the sampler only needs target argmax
+    token ids.  DeepSeek V4 Flash on TP=2 pays this full-vocab cost every decode
+    step, so expose the target model's vocab-parallel get_top_tokens() and route
+    strictly safe greedy speculative batches through an argmax-only sampler path.
+
+    The fast path is deliberately conservative: it only runs for all-greedy
+    requests with no logprobs, no penalties/bad words/allowed-token masks, and no
+    active non-argmax-invariant logits processors.  MinTokens processors are
+    allowed only when their current mask is empty (e.g. ignore_eos=True).
+    """
+
+    model_path = Path(
+        "/usr/local/lib/python3.12/dist-packages/vllm/model_executor/"
+        "models/deepseek_v4.py"
+    )
+    if model_path.exists():
+        source = model_path.read_text()
+        if "def get_top_tokens(" not in source:
+            old = '''    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor | None:
+        logits = self.logits_processor(self.lm_head, hidden_states)
+        return logits
+'''
+            new = old + '''
+    def get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
+'''
+            if old not in source:
+                raise RuntimeError(
+                    f"Could not patch DeepSeek V4 target local argmax in {model_path}"
+                )
+            model_path.write_text(source.replace(old, new, 1))
+
+    sampler_path = Path(
+        "/usr/local/lib/python3.12/dist-packages/vllm/v1/sample/"
+        "rejection_sampler.py"
+    )
+    source = sampler_path.read_text()
+    if "def forward_greedy_argmax(" not in source:
+        anchor = '''    def _get_logprobs_tensors(
+        self,
+        max_num_logprobs: int,
+'''
+        insert = '''    def forward_greedy_argmax(
+        self,
+        metadata: SpecDecodeMetadata,
+        target_argmax: torch.Tensor,
+        bonus_token_ids: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> SamplerOutput:
+        """Greedy speculative sampler when target argmax ids are precomputed.
+
+        This is equivalent to the all-greedy branch of rejection_sample(), but it
+        avoids building full target logits/probabilities.  Callers must ensure no
+        logits processors that can alter greedy argmax are active.
+        """
+        assert metadata.max_spec_len <= MAX_SPEC_LEN
+        assert sampling_metadata.all_greedy
+        assert sampling_metadata.max_num_logprobs is None
+        assert not getattr(self, "synthetic_mode", False)
+
+        batch_size = len(metadata.num_draft_tokens)
+        output_token_ids = torch.full(
+            (batch_size, metadata.max_spec_len + 1),
+            PLACEHOLDER_TOKEN_ID,
+            dtype=torch.int32,
+            device=target_argmax.device,
+        )
+        if bonus_token_ids.ndim == 1:
+            bonus_token_ids = bonus_token_ids.unsqueeze(-1)
+        rejection_greedy_sample_kernel[(batch_size,)](
+            output_token_ids,
+            metadata.cu_num_draft_tokens,
+            metadata.draft_token_ids,
+            target_argmax,
+            bonus_token_ids.to(torch.int32),
+            None,
+            metadata.max_spec_len,
+        )
+        return SamplerOutput(
+            sampled_token_ids=output_token_ids,
+            logprobs_tensors=None,
+        )
+
+'''
+        if anchor not in source:
+            raise RuntimeError(
+                f"Could not patch greedy argmax rejection sampler in {sampler_path}"
+            )
+        source = source.replace(anchor, insert + anchor, 1)
+        sampler_path.write_text(source)
+
+    runner_path = Path(
+        "/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/"
+        "gpu_model_runner.py"
+    )
+    source = runner_path.read_text()
+    if "def _sm120_can_use_greedy_spec_argmax(" not in source:
+        anchor = '''    def _bookkeeping_sync(
+        self,
+        scheduler_output: "SchedulerOutput",
+'''
+        insert = '''    def _sm120_can_use_greedy_spec_argmax(self) -> bool:
+        import os
+
+        if os.environ.get("DG_SM120_SPEC_ARGMAX_FASTPATH", "1").lower() not in (
+            "1", "true", "yes", "on"
+        ):
+            return False
+        if not hasattr(self.model, "get_top_tokens"):
+            return False
+        sampling_metadata = self.input_batch.sampling_metadata
+        if not sampling_metadata.all_greedy:
+            return False
+        if sampling_metadata.max_num_logprobs is not None:
+            return False
+        if sampling_metadata.logprob_token_ids:
+            return False
+        if sampling_metadata.allowed_token_ids_mask is not None:
+            return False
+        if not sampling_metadata.no_penalties:
+            return False
+        if sampling_metadata.bad_words_token_ids:
+            return False
+
+        # Any active processor that can alter argmax makes precomputed argmax
+        # unsafe.  MinTokens is allowed only when it currently masks no tokens
+        # (common with ignore_eos=True).
+        for proc in sampling_metadata.logitsprocs.non_argmax_invariant:
+            if proc.__class__.__name__ != "MinTokensLogitsProcessor":
+                return False
+            logits_slice = getattr(proc, "logits_slice", None)
+            if logits_slice is None:
+                return False
+            req_slice = logits_slice[0]
+            if req_slice is not None and req_slice.numel() != 0:
+                return False
+        return True
+
+'''
+        if anchor not in source:
+            raise RuntimeError(
+                f"Could not insert SM120 greedy spec guard in {runner_path}"
+            )
+        source = source.replace(anchor, insert + anchor, 1)
+
+    old_sample = '''        sampler_output = self.rejection_sampler(
+            spec_decode_metadata,
+            None,  # draft_probs
+            logits,
+            sampling_metadata,
+        )
+        return sampler_output
+'''
+    new_sample = '''        sm120_argmax_fastpath = getattr(
+            self, "_sm120_spec_argmax_fastpath", None
+        )
+        if sm120_argmax_fastpath is not None:
+            self._sm120_spec_argmax_fastpath = None
+            target_argmax, bonus_token_ids = sm120_argmax_fastpath
+            return self.rejection_sampler.forward_greedy_argmax(
+                spec_decode_metadata,
+                target_argmax,
+                bonus_token_ids,
+                sampling_metadata,
+            )
+
+        sampler_output = self.rejection_sampler(
+            spec_decode_metadata,
+            None,  # draft_probs
+            logits,
+            sampling_metadata,
+        )
+        return sampler_output
+'''
+    if old_sample in source and "forward_greedy_argmax(" not in source[
+        source.find("def _sample(") : source.find("def _bookkeeping_sync(")
+    ]:
+        source = source.replace(old_sample, new_sample, 1)
+
+    old_logits = '''                sample_hidden_states = hidden_states[logits_indices]
+                logits = self.model.compute_logits(sample_hidden_states)
+'''
+    new_logits = '''                sample_hidden_states = hidden_states[logits_indices]
+                if (
+                    spec_decode_metadata is not None
+                    and self._sm120_can_use_greedy_spec_argmax()
+                ):
+                    sm120_top_token_ids = self.model.get_top_tokens(sample_hidden_states)
+                    self._sm120_spec_argmax_fastpath = (
+                        sm120_top_token_ids[spec_decode_metadata.target_logits_indices],
+                        sm120_top_token_ids[spec_decode_metadata.bonus_logits_indices],
+                    )
+                    logits = None
+                else:
+                    self._sm120_spec_argmax_fastpath = None
+                    logits = self.model.compute_logits(sample_hidden_states)
+'''
+    if old_logits in source and "sm120_top_token_ids = self.model.get_top_tokens" not in source:
+        source = source.replace(old_logits, new_logits, 1)
+    elif "sm120_top_token_ids = self.model.get_top_tokens" not in source:
+        raise RuntimeError(
+            f"Could not patch SM120 target argmax fast path in {runner_path}"
+        )
+
+    runner_path.write_text(source)
 
 
 patch_cuda_platform_deep_gemm_sm120()
@@ -3103,6 +3736,8 @@ patch_deep_gemm_wrapper_with_starts()
 patch_deep_gemm_moe_permute_starts()
 patch_deep_gemm_moe_with_starts()
 patch_deep_gemm_moe_fused_activation_quant()
+patch_deepseek_mtp_local_argmax_reduction()
+patch_deepseek_v4_greedy_spec_argmax_fastpath()
 patch_sm120_b12x_deep_gemm_moe()
 patch_deepseek_v4_attention()
 patch_flashmla_sparse_decode()

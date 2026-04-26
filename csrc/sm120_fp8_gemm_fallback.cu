@@ -10,6 +10,7 @@
 #include "cute/arch/mma_sm120.hpp"
 #include "cutlass/numeric_types.h"
 
+#include "jit_kernels/impls/sm120_fp8_fp8_cutlass.hpp"
 #include "jit_kernels/impls/sm120_fp8_gemm_fallback.hpp"
 #include "utils/system.hpp"
 #include "jit_kernels/impls/smxx_cublaslt.hpp"
@@ -515,6 +516,78 @@ __global__ void fp8_c128_m1_predecoded_a_contig_ue8m0_kblock_gemm_kernel(
         for (int kk = k_block_start + threadIdx.x; kk < k_block_end;
              kk += blockDim.x) {
             const float av = a_dequant[kk];
+#pragma unroll
+            for (int i = 0; i < kColsPerBlock; ++i) {
+                const int col = col_base + i;
+                if (col < n) {
+                    const float bv = fp8_e4m3fn_to_float(
+                        b[static_cast<int64_t>(col) * b_stride0 + kk]);
+                    partial[i] += av * bv * block_scales[i];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    reduce_cols_in_block<kColsPerBlock>(partial, reductions);
+
+    if (threadIdx.x == 0) {
+#pragma unroll
+        for (int i = 0; i < kColsPerBlock; ++i) {
+            const int col = col_base + i;
+            if (col < n) {
+                const int64_t out_offset =
+                    static_cast<int64_t>(col) * d_stride1;
+                float value = reductions[i][0];
+                if (accumulate)
+                    value += load_direct_gemm<out_t>(d, out_offset);
+                store_direct_gemm<out_t>(d, out_offset, value);
+            }
+        }
+    }
+}
+
+template <typename out_t, int kColsPerBlock>
+__global__ void fp8_c128_m1_fused_contig_ue8m0_kblock_gemm_kernel(
+    const uint8_t* __restrict__ a, const int32_t* __restrict__ sfa,
+    const uint8_t* __restrict__ b, const int32_t* __restrict__ sfb,
+    out_t* __restrict__ d, int n, int k, int64_t a_stride1,
+    int64_t b_stride0, int64_t d_stride1, int64_t sfa_stride1,
+    int64_t sfb_stride0, int64_t sfb_stride1, bool accumulate) {
+    __shared__ float reductions[kColsPerBlock][8];
+    __shared__ float block_scales[kColsPerBlock];
+    float partial[kColsPerBlock];
+#pragma unroll
+    for (int i = 0; i < kColsPerBlock; ++i)
+        partial[i] = 0.0f;
+
+    const int col_base = blockIdx.x * kColsPerBlock;
+    for (int k_block_start = 0, k_block = 0; k_block_start < k;
+         k_block_start += 128, ++k_block) {
+        const int32_t a_word =
+            sfa[static_cast<int64_t>(k_block / 4) * sfa_stride1];
+        const int a_exponent = (a_word >> ((k_block & 3) * 8)) & 0xff;
+        const float a_scale = scale_from_ue8m0_exponent(a_exponent);
+        if (threadIdx.x < kColsPerBlock) {
+            const int col = col_base + threadIdx.x;
+            if (col < n) {
+                const int32_t b_word =
+                    sfb[static_cast<int64_t>(col) * sfb_stride0 +
+                        static_cast<int64_t>(k_block / 4) * sfb_stride1];
+                const int b_exponent = (b_word >> ((k_block & 3) * 8)) & 0xff;
+                block_scales[threadIdx.x] =
+                    a_scale * scale_from_ue8m0_exponent(b_exponent);
+            } else {
+                block_scales[threadIdx.x] = 0.0f;
+            }
+        }
+        __syncthreads();
+
+        const int k_block_end = min(k, k_block_start + 128);
+        for (int kk = k_block_start + threadIdx.x; kk < k_block_end;
+             kk += blockDim.x) {
+            const float av = fp8_e4m3fn_to_float(
+                a[static_cast<int64_t>(kk) * a_stride1]);
 #pragma unroll
             for (int i = 0; i < kColsPerBlock; ++i) {
                 const int col = col_base + i;
@@ -1349,6 +1422,7 @@ void predecoded_a_fp8_c128_gemm_m1(const torch::Tensor& a,
     int default_kblock_threads = 128;
     if (k <= 2048 && n >= 16384) {
         default_kblock_cols = 8;
+        default_kblock_threads = 64;
     } else if (k <= 2048 && n >= 8192) {
         default_kblock_cols = 4;
         default_kblock_threads = 64;
@@ -1366,8 +1440,53 @@ void predecoded_a_fp8_c128_gemm_m1(const torch::Tensor& a,
         std::getenv("DG_SM120_DISABLE_FP8_M1_CONTIG_UE8M0_KBLOCK") == nullptr &&
         sfb_type == 1 && gran_mn_b == 1 && gran_k_b == 128 &&
         b.stride(1) == 1 && d.stride(1) == 1;
+    const bool use_fused_contig_ue8m0_kblock =
+        env_flag_enabled("DG_SM120_ENABLE_FP8_M1_FUSED") &&
+        use_kblock_scale && sfa_type == 1 && sfb_type == 1 &&
+        gran_k_a == 128 && gran_mn_b == 1 && gran_k_b == 128 &&
+        a.stride(1) == 1 && b.stride(1) == 1 && d.stride(1) == 1;
     const bool use_warp_col =
-        use_warp_col_requested && !use_contig_ue8m0_kblock;
+        use_warp_col_requested && !use_contig_ue8m0_kblock &&
+        !use_fused_contig_ue8m0_kblock;
+
+#define DG_SM120_LAUNCH_FUSED_M1_CONTIG(OUT_T, OUT_PTR, COLS)           \
+    do {                                                                \
+        fp8_c128_m1_fused_contig_ue8m0_kblock_gemm_kernel<OUT_T, COLS>  \
+            <<<(n + COLS - 1) / COLS, kblock_threads, 0, stream>>>(     \
+                reinterpret_cast<const uint8_t*>(a.data_ptr()),         \
+                static_cast<const int32_t*>(sfa.data_ptr()),            \
+                reinterpret_cast<const uint8_t*>(b.data_ptr()),         \
+                static_cast<const int32_t*>(sfb.data_ptr()), OUT_PTR,   \
+                n, k, a.stride(1), b.stride(0), d.stride(1),            \
+                sfa.stride(1), sfb.stride(0), sfb.stride(1),            \
+                accumulate);                                            \
+    } while (0)
+    if (use_fused_contig_ue8m0_kblock) {
+        if (d.scalar_type() == torch::kBFloat16) {
+            auto* out_ptr = reinterpret_cast<__nv_bfloat16*>(d.data_ptr());
+            if (kblock_cols >= 16) {
+                DG_SM120_LAUNCH_FUSED_M1_CONTIG(__nv_bfloat16, out_ptr, 16);
+            } else if (kblock_cols >= 8) {
+                DG_SM120_LAUNCH_FUSED_M1_CONTIG(__nv_bfloat16, out_ptr, 8);
+            } else {
+                DG_SM120_LAUNCH_FUSED_M1_CONTIG(__nv_bfloat16, out_ptr, 4);
+            }
+        } else if (d.scalar_type() == torch::kFloat32) {
+            auto* out_ptr = d.data_ptr<float>();
+            if (kblock_cols >= 16) {
+                DG_SM120_LAUNCH_FUSED_M1_CONTIG(float, out_ptr, 16);
+            } else if (kblock_cols >= 8) {
+                DG_SM120_LAUNCH_FUSED_M1_CONTIG(float, out_ptr, 8);
+            } else {
+                DG_SM120_LAUNCH_FUSED_M1_CONTIG(float, out_ptr, 4);
+            }
+        } else {
+            DG_HOST_UNREACHABLE("Unsupported output dtype for SM120 FP8 GEMM");
+        }
+        DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
+        return;
+    }
+#undef DG_SM120_LAUNCH_FUSED_M1_CONTIG
 
     auto a_dequant = torch::empty({k}, a.options().dtype(torch::kFloat32));
     const int dequant_grid = fallback_grid(k);
@@ -1916,6 +2035,47 @@ void sm120_fp8_bhr_hdr_bhd(const torch::Tensor& a,
     const int64_t bs_s1 = b_scale_flat ? b_scale.stride(1) : b_scale.stride(1);
     const int64_t bs_s2 = b_scale_flat ? b_scale.stride(1) : b_scale.stride(2);
 
+    if (std::getenv("DG_SM120_DISABLE_BHR_CUTLASS_PREFILL") == nullptr &&
+        out.scalar_type() == torch::kBFloat16 && B >= 16 && D % 128 == 0 &&
+        R % 128 == 0 && a_scale_type >= 0 && b_scale_type >= 0) {
+        bool launched_all_heads = true;
+        for (int h = 0; h < H; ++h) {
+            torch::Tensor a_h = a.select(1, h);
+            torch::Tensor b_h =
+                b.dim() == 3 ? b.select(0, h)
+                             : b.narrow(0, static_cast<int64_t>(h) * D, D);
+            torch::Tensor out_h = out.select(1, h);
+            torch::Tensor a_scale_h;
+            if (a_scale_flat) {
+                a_scale_h = a_scale.as_strided(
+                    {B, a_expected_last},
+                    {static_cast<int64_t>(H) * a_scale.stride(0),
+                     a_scale.stride(1)},
+                    static_cast<int64_t>(h) * a_scale.stride(0));
+            } else {
+                a_scale_h = a_scale.select(1, h);
+            }
+            torch::Tensor b_scale_h;
+            if (b_scale_flat) {
+                b_scale_h = b_scale.narrow(
+                    0, static_cast<int64_t>(h) * b_scale_d_size,
+                    b_scale_d_size);
+            } else {
+                b_scale_h = b_scale.select(0, h);
+            }
+            if (!sm120_fp8_fp8_gemm_nt_cutlass(
+                    a_h, a_scale_h, b_h, b_scale_h, out_h, B, D, R, 1, 128,
+                    b_scale_gran_d, 128, cute::UMMA::Major::K,
+                    cute::UMMA::Major::K, false)) {
+                launched_all_heads = false;
+                break;
+            }
+        }
+        if (launched_all_heads) {
+            return;
+        }
+    }
+
             const bool use_m1_mma =
                 env_flag_enabled("DG_SM120_ENABLE_BHR_M1_MMA") &&
                 out.scalar_type() == torch::kBFloat16 && a_scale_type == 1 &&
@@ -1923,12 +2083,15 @@ void sm120_fp8_bhr_hdr_bhd(const torch::Tensor& a,
                 b_scale_gran_d == 128;
             const bool use_decode_warp_col =
                 R <= 512 && D <= 2048 && B * H <= 64;
+            const bool use_prefill_warp_col =
+                R <= 512 && D <= 2048 && B * H > 64;
             const bool use_long_warp_col =
                 R >= 2048 && D <= 4096 && B * H <= 64;
             const bool use_warp_col =
                 env_flag_enabled("DG_SM120_ENABLE_BHR_WARPCOL") ||
                 (env_flag_enabled("DG_SM120_ENABLE_BHR_WARPCOL_HEURISTIC") &&
-                 (use_decode_warp_col || use_long_warp_col));
+                 (use_decode_warp_col || use_prefill_warp_col ||
+                  use_long_warp_col));
 		    const bool use_kblock =
 		        std::getenv("DG_SM120_BHR_KBLOCK_SCALE") != nullptr &&
 		        R <= 512 && B * H <= 64 && !use_m1_mma && !use_warp_col;
@@ -1971,10 +2134,15 @@ void sm120_fp8_bhr_hdr_bhd(const torch::Tensor& a,
             if (warps_per_block != 8)
                 warps_per_block = 4;
             int cols_per_warp =
-                env_int_or_default("DG_SM120_BHR_WARPCOL_COLS", 1);
+                env_int_or_default("DG_SM120_BHR_WARPCOL_COLS", 0);
             if (cols_per_warp != 1 && cols_per_warp != 2 &&
                 cols_per_warp != 4) {
-                cols_per_warp = 2;
+                // Decode has too little row parallelism for multi-column warps to
+                // pay off, while multi-token BHR projection/prefill is dominated
+                // by launching one warp per output column.  Let each warp compute
+                // four adjacent columns for the multi-token path to reduce block
+                // count and reuse the same A vector/scales across columns.
+                cols_per_warp = use_prefill_warp_col ? 4 : 1;
             }
             const int d_groups = (D + cols_per_warp - 1) / cols_per_warp;
             const int grid =

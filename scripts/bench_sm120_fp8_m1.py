@@ -43,6 +43,7 @@ def set_mode(mode: str) -> None:
     os.environ.pop("DG_SM120_ENABLE_FP8_M1_REGSCALE", None)
     os.environ.pop("DG_SM120_ENABLE_FP8_M1_WARPCOL", None)
     os.environ.pop("DG_SM120_ENABLE_FP8_M1_WARPCOL_HEURISTIC", None)
+    os.environ.pop("DG_SM120_ENABLE_FP8_M1_FUSED", None)
     os.environ.pop("DG_SM120_ENABLE_FP8_M1_CONTIG_UE8M0_KBLOCK", None)
     os.environ.pop("DG_SM120_DISABLE_FP8_M1_CONTIG_UE8M0_KBLOCK", None)
     os.environ.pop("DG_SM120_FP8_M1_KBLOCK_COLS", None)
@@ -60,6 +61,14 @@ def set_mode(mode: str) -> None:
     elif mode.startswith("contig"):
         os.environ["DG_SM120_ENABLE_FP8_M1_KBLOCK"] = "1"
         os.environ["DG_SM120_ENABLE_FP8_M1_CONTIG_UE8M0_KBLOCK"] = "1"
+        parts = mode.split(":")
+        if len(parts) >= 2:
+            os.environ["DG_SM120_FP8_M1_KBLOCK_COLS"] = parts[1]
+        if len(parts) >= 3:
+            os.environ["DG_SM120_FP8_M1_KBLOCK_THREADS"] = parts[2]
+    elif mode.startswith("fused"):
+        os.environ["DG_SM120_ENABLE_FP8_M1_KBLOCK"] = "1"
+        os.environ["DG_SM120_ENABLE_FP8_M1_FUSED"] = "1"
         parts = mode.split(":")
         if len(parts) >= 2:
             os.environ["DG_SM120_FP8_M1_KBLOCK_COLS"] = parts[1]
@@ -104,7 +113,7 @@ def main() -> None:
     parser.add_argument(
         "--modes",
         default="default,kblock,hybrid,regscale:4:128,warpcol:4,cute",
-        help="Comma-separated modes: default, cute, kblock[:cols[:threads]], contig[:cols[:threads]], regscale[:cols[:threads]], warpcol[:warps]",
+        help="Comma-separated modes: default, cute, kblock[:cols[:threads]], contig[:cols[:threads]], fused[:cols[:threads]], regscale[:cols[:threads]], warpcol[:warps]",
     )
     args = parser.parse_args()
 
@@ -129,9 +138,14 @@ def main() -> None:
     for mode in modes:
         diff = (ref.float() - outputs[mode].float()).abs()
         timings[mode] = bench(case, outputs[mode], mode, args.warmup, args.iters)
+
+    speedup_base = timings.get("default", timings[modes[0]])
+    speedup_label = "default" if "default" in timings else modes[0]
+    for mode in modes:
+        diff = (ref.float() - outputs[mode].float()).abs()
         print(
             f"{mode}: us={timings[mode]:.3f} "
-            f"speedup={timings['default'] / timings[mode]:.3f}x "
+            f"speedup_vs_{speedup_label}={speedup_base / timings[mode]:.3f}x "
             f"max_abs_diff={diff.max().item():.6g} "
             f"mean_abs_diff={diff.mean().item():.6g} "
             f"max_rel_diff={(diff / ref_abs).max().item():.6g}"

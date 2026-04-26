@@ -777,7 +777,17 @@ bool sm120_m_grouped_fp8_fp4_gemm_nt_contiguous_cutlass_impl(
     const int device = a.get_device();
     const bool compact_active_groups = expert_starts != nullptr && expert_counts != nullptr &&
                                        !use_psum_layout;
-    const int gemm_num_groups = compact_active_groups ? std::min(num_groups, m) : num_groups;
+    // Compacting active experts only helps when it can reduce the grouped-GEMM
+    // problem count. For live DeepSeek V4 decode/prefill shapes vLLM often
+    // pads M above the expert count (for example M=162, groups=128); compacting
+    // those shapes still launches 128 CUTLASS groups but pays an extra init
+    // kernel plus atomics. In that no-shrink regime, use the direct per-expert
+    // setup path and let inactive experts become zero-row problems.
+    const bool direct_expert_groups = compact_active_groups && m >= num_groups &&
+        env_flag_enabled("DG_SM120_MOE_DIRECT_GROUPS_WHEN_NO_SHRINK");
+    const int gemm_num_groups =
+        compact_active_groups && !direct_expert_groups ? std::min(num_groups, m)
+                                                       : num_groups;
     const int k32 = k / 32;
     const int sfa_kind = sfa.scalar_type() == torch::kFloat32 ? 0 : 1;
     const bool sfb_is_prepacked = sfb.scalar_type() == torch::kUInt8 && sfb.dim() == 2;
@@ -801,8 +811,10 @@ bool sm120_m_grouped_fp8_fp4_gemm_nt_contiguous_cutlass_impl(
     StaticScale sfb_ue8 = get_or_create_sfb(sfb, num_groups, n, k32, m, k,
                                             sfb_group_elems, stream);
 
-    if (compact_active_groups && m <= 64 && n % 8 == 0 && k % 32 == 0 &&
-        sfa_kind == 1 && sfb_is_prepacked &&
+    const int small_m_mma_max_m =
+        env_int_or_default("DG_SM120_SMALL_M_MMA_MAX_M", 64);
+    if (compact_active_groups && m <= small_m_mma_max_m && n % 8 == 0 &&
+        k % 32 == 0 && sfa_kind == 1 && sfb_is_prepacked &&
         env_flag_enabled("DG_SM120_ENABLE_SMALL_M_MMA")) {
         constexpr int small_m_warps_per_block = 4;
         small_m_fp8_fp4_mma_kernel<<<
@@ -826,7 +838,17 @@ bool sm120_m_grouped_fp8_fp4_gemm_nt_contiguous_cutlass_impl(
     hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(device);
 
     typename Gemm::GemmKernel::TileSchedulerArguments scheduler;
-    scheduler.raster_order = cutlass::gemm::kernel::detail::RasterOrderOptions::AlongM;
+    const int raster_order = env_int_or_default("DG_SM120_MOE_RASTER_ORDER", 0);
+    if (raster_order == 1) {
+        scheduler.raster_order =
+            cutlass::gemm::kernel::detail::RasterOrderOptions::AlongN;
+    } else if (raster_order == 2) {
+        scheduler.raster_order =
+            cutlass::gemm::kernel::detail::RasterOrderOptions::Heuristic;
+    } else {
+        scheduler.raster_order =
+            cutlass::gemm::kernel::detail::RasterOrderOptions::AlongM;
+    }
 
     typename Gemm::Arguments arguments{
         cutlass::gemm::GemmUniversalMode::kGrouped,
@@ -884,31 +906,48 @@ bool sm120_m_grouped_fp8_fp4_gemm_nt_contiguous_cutlass_impl(
             DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
         }
 
-        init_compact_grouped_kernel<<<
-            std::max(1, (gemm_num_groups + 255) / 256), 256, 0, stream>>>(
-            reinterpret_cast<const uint8_t*>(a.data_ptr()), b.data_ptr<int8_t>(),
-            reinterpret_cast<ElementD*>(d.data_ptr()), scratch.ptr_a,
-            scratch.ptr_b, scratch.ptr_sfa, scratch.ptr_sfb, scratch.ptr_d,
-            scratch.stride_a, scratch.stride_b, scratch.stride_d,
-            scratch.layout_sfa, scratch.layout_sfb, scratch.problems,
-            scratch.sfa_ue8, sfb_ue8.data, scratch.active_count,
-            gemm_num_groups, n, k, sfb_layout_m, sfa_group_elems,
-            sfb_group_elems, d.stride(0));
-        DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
+        if (direct_expert_groups) {
+            prepare_grouped_kernel<<<num_groups, 256, 0, stream>>>(
+                reinterpret_cast<const uint8_t*>(a.data_ptr()), sfa.data_ptr(),
+                b.data_ptr<int8_t>(), reinterpret_cast<ElementD*>(d.data_ptr()),
+                grouped_layout.data_ptr<int32_t>(),
+                expert_starts->data_ptr<int32_t>(),
+                expert_counts->data_ptr<int32_t>(), scratch.ptr_a, scratch.ptr_b,
+                scratch.ptr_sfa, scratch.ptr_sfb, scratch.ptr_d, scratch.stride_a,
+                scratch.stride_b, scratch.stride_d, scratch.layout_sfa,
+                scratch.layout_sfb, scratch.problems, scratch.sfa_ue8,
+                sfb_ue8.data, num_groups, m, n, k, k32, sfa_kind,
+                sfb_layout_m, sfa_group_elems, sfb_group_elems, a.stride(0),
+                a.stride(1), sfa.stride(0), sfa.stride(1), b.stride(0),
+                d.stride(0), d.stride(1));
+            DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
+        } else {
+            init_compact_grouped_kernel<<<
+                std::max(1, (gemm_num_groups + 255) / 256), 256, 0, stream>>>(
+                reinterpret_cast<const uint8_t*>(a.data_ptr()), b.data_ptr<int8_t>(),
+                reinterpret_cast<ElementD*>(d.data_ptr()), scratch.ptr_a,
+                scratch.ptr_b, scratch.ptr_sfa, scratch.ptr_sfb, scratch.ptr_d,
+                scratch.stride_a, scratch.stride_b, scratch.stride_d,
+                scratch.layout_sfa, scratch.layout_sfb, scratch.problems,
+                scratch.sfa_ue8, sfb_ue8.data, scratch.active_count,
+                gemm_num_groups, n, k, sfb_layout_m, sfa_group_elems,
+                sfb_group_elems, d.stride(0));
+            DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
 
-        prepare_compact_grouped_kernel<<<num_groups, 256, 0, stream>>>(
-            reinterpret_cast<const uint8_t*>(a.data_ptr()), sfa.data_ptr(),
-            b.data_ptr<int8_t>(), reinterpret_cast<ElementD*>(d.data_ptr()),
-            expert_starts->data_ptr<int32_t>(), expert_counts->data_ptr<int32_t>(),
-            scratch.ptr_a, scratch.ptr_b, scratch.ptr_sfa, scratch.ptr_sfb,
-            scratch.ptr_d, scratch.stride_a, scratch.stride_b, scratch.stride_d,
-            scratch.layout_sfa, scratch.layout_sfb, scratch.problems,
-            scratch.sfa_ue8, sfb_ue8.data, scratch.active_count, num_groups,
-            gemm_num_groups, m, n, k, k32, sfa_kind, sfb_layout_m,
-            sfa_group_elems, sfb_group_elems, a.stride(0), a.stride(1),
-            sfa.stride(0), sfa.stride(1), b.stride(0), d.stride(0),
-            d.stride(1));
-        DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
+            prepare_compact_grouped_kernel<<<num_groups, 256, 0, stream>>>(
+                reinterpret_cast<const uint8_t*>(a.data_ptr()), sfa.data_ptr(),
+                b.data_ptr<int8_t>(), reinterpret_cast<ElementD*>(d.data_ptr()),
+                expert_starts->data_ptr<int32_t>(), expert_counts->data_ptr<int32_t>(),
+                scratch.ptr_a, scratch.ptr_b, scratch.ptr_sfa, scratch.ptr_sfb,
+                scratch.ptr_d, scratch.stride_a, scratch.stride_b, scratch.stride_d,
+                scratch.layout_sfa, scratch.layout_sfb, scratch.problems,
+                scratch.sfa_ue8, sfb_ue8.data, scratch.active_count, num_groups,
+                gemm_num_groups, m, n, k, k32, sfa_kind, sfb_layout_m,
+                sfa_group_elems, sfb_group_elems, a.stride(0), a.stride(1),
+                sfa.stride(0), sfa.stride(1), b.stride(0), d.stride(0),
+                d.stride(1));
+            DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
+        }
     } else {
         fill_scale_kernel<<<static_cast<unsigned>((sfa_total_elems + 255) / 256), 256, 0, stream>>>(
             scratch.sfa_ue8, sfa_total_elems);

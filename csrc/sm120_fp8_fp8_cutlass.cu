@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <vector>
 
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
@@ -82,26 +83,47 @@ struct DenseScratch {
     size_t sfa_capacity = 0;
     size_t sfb_capacity = 0;
     size_t workspace_capacity = 0;
+    bool sfa_prefilled = false;
+    int sfa_prefill_m = 0;
+    int sfa_prefill_n = 0;
+    int sfa_prefill_k = 0;
+    size_t sfa_prefill_elems = 0;
     ElementSF* sfa = nullptr;
     ElementSF* sfb = nullptr;
     void* workspace = nullptr;
 };
 
+struct DenseSfbCacheEntry {
+    int device = -1;
+    uintptr_t data_ptr = 0;
+    int scale_type = -1;
+    int m = 0;
+    int n = 0;
+    int k = 0;
+    int gran_mn = 0;
+    int gran_k = 0;
+    int64_t stride0 = 0;
+    int64_t stride1 = 0;
+    size_t elems = 0;
+    ElementSF* data = nullptr;
+};
+
 std::mutex g_mutex;
 DenseScratch g_scratch[16];
+std::vector<DenseSfbCacheEntry> g_sfb_cache[16];
 
 void cuda_check(cudaError_t status) {
     DG_HOST_ASSERT(status == cudaSuccess);
 }
 
-void* reserve_bytes(void*& ptr, size_t& capacity, size_t needed) {
+bool reserve_bytes(void*& ptr, size_t& capacity, size_t needed) {
     if (capacity >= needed)
-        return ptr;
+        return false;
     if (ptr != nullptr)
         cuda_check(cudaFree(ptr));
     cuda_check(cudaMalloc(&ptr, needed));
     capacity = needed;
-    return ptr;
+    return true;
 }
 
 bool env_flag_enabled(const char* name) {
@@ -111,12 +133,23 @@ bool env_flag_enabled(const char* name) {
            std::strcmp(value, "False") != 0;
 }
 
+bool env_flag_default_enabled(const char* name) {
+    const char* value = std::getenv(name);
+    return value == nullptr || (std::strcmp(value, "0") != 0 &&
+                                std::strcmp(value, "false") != 0 &&
+                                std::strcmp(value, "False") != 0);
+}
+
 DenseScratch& get_scratch(int device, size_t sfa_bytes, size_t sfb_bytes,
                           size_t workspace_bytes) {
     std::lock_guard<std::mutex> lock(g_mutex);
     DenseScratch& s = g_scratch[device];
     s.device = device;
-    reserve_bytes(reinterpret_cast<void*&>(s.sfa), s.sfa_capacity, sfa_bytes);
+    if (reserve_bytes(reinterpret_cast<void*&>(s.sfa), s.sfa_capacity,
+                      sfa_bytes)) {
+        s.sfa_prefilled = false;
+        s.sfa_prefill_elems = 0;
+    }
     reserve_bytes(reinterpret_cast<void*&>(s.sfb), s.sfb_capacity, sfb_bytes);
     reserve_bytes(s.workspace, s.workspace_capacity, workspace_bytes);
     return s;
@@ -193,6 +226,53 @@ __global__ void convert_sfb_kernel(const void* __restrict__ sfb,
         reinterpret_cast<uint8_t*>(out)[out_idx] =
             load_ue8m0_raw(packed, scale_base, stride1, k_block);
     }
+}
+
+ElementSF* get_cached_sfb(int device, const torch::Tensor& sfb, int scale_type,
+                          int m, int n, int k, int k32, size_t sfb_elems,
+                          int gran_mn, int gran_k, int64_t stride0,
+                          int64_t stride1, cudaStream_t stream) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto& cache = g_sfb_cache[device];
+    const uintptr_t data_ptr =
+        reinterpret_cast<uintptr_t>(sfb.data_ptr());
+    for (auto& entry : cache) {
+        if (entry.device == device && entry.data_ptr == data_ptr &&
+            entry.scale_type == scale_type && entry.m == m && entry.n == n &&
+            entry.k == k && entry.gran_mn == gran_mn &&
+            entry.gran_k == gran_k && entry.stride0 == stride0 &&
+            entry.stride1 == stride1 && entry.elems == sfb_elems) {
+            return entry.data;
+        }
+    }
+
+    DenseSfbCacheEntry entry;
+    entry.device = device;
+    entry.data_ptr = data_ptr;
+    entry.scale_type = scale_type;
+    entry.m = m;
+    entry.n = n;
+    entry.k = k;
+    entry.gran_mn = gran_mn;
+    entry.gran_k = gran_k;
+    entry.stride0 = stride0;
+    entry.stride1 = stride1;
+    entry.elems = sfb_elems;
+    cuda_check(cudaMalloc(reinterpret_cast<void**>(&entry.data),
+                          sizeof(ElementSF) * sfb_elems));
+
+    fill_scale_kernel<<<static_cast<unsigned>((sfb_elems + 255) / 256), 256, 0,
+                        stream>>>(entry.data, sfb_elems);
+    DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
+    const int sfb_total = n * k32;
+    convert_sfb_kernel<<<(sfb_total + 255) / 256, 256, 0, stream>>>(
+        sfb.data_ptr(), entry.data, sfb_total, scale_type, m, n, k, k32,
+        gran_mn, gran_k, stride0, stride1);
+    DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
+
+    ElementSF* ptr = entry.data;
+    cache.push_back(entry);
+    return ptr;
 }
 
 int scale_tensor_type(const torch::Tensor& scale) {
@@ -359,15 +439,15 @@ bool sm120_fp8_fp8_gemm_nt_cutlass(
         MxScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, 1));
     const size_t sfa_elems = static_cast<size_t>(size(filter_zeros(layout_sfa)));
     const size_t sfb_elems = static_cast<size_t>(size(filter_zeros(layout_sfb)));
+    const int sfa_type = scale_tensor_type(sfa);
+    const int sfb_type = scale_tensor_type(sfb);
+    const bool cache_sfb =
+        env_flag_default_enabled("DG_SM120_CACHE_FP8_SFB");
 
-    StrideA stride_a =
-        cutlass::make_cute_packed_stride(StrideA{}, make_shape(m, k, 1));
-    StrideB stride_b =
-        cutlass::make_cute_packed_stride(StrideB{}, make_shape(n, k, 1));
-    StrideC stride_c =
-        cutlass::make_cute_packed_stride(StrideC{}, make_shape(m, n, 1));
-    StrideD stride_d =
-        cutlass::make_cute_packed_stride(StrideD{}, make_shape(m, n, 1));
+    StrideA stride_a{a.stride(0), cute::Int<1>{}, 0};
+    StrideB stride_b{b.stride(0), cute::Int<1>{}, 0};
+    StrideC stride_c{d.stride(0), cute::Int<1>{}, 0};
+    StrideD stride_d{d.stride(0), cute::Int<1>{}, 0};
 
     typename Gemm::Arguments arguments{
         cutlass::gemm::GemmUniversalMode::kGemm,
@@ -383,32 +463,54 @@ bool sm120_fp8_fp8_gemm_nt_cutlass(
     const int device = a.get_device();
     DenseScratch& scratch =
         get_scratch(device, sizeof(ElementSF) * sfa_elems,
-                    sizeof(ElementSF) * sfb_elems, workspace_size);
+                    cache_sfb ? 0 : sizeof(ElementSF) * sfb_elems,
+                    workspace_size);
     arguments.mainloop.ptr_SFA = scratch.sfa;
-    arguments.mainloop.ptr_SFB = scratch.sfb;
 
     const auto stream = at::cuda::getCurrentCUDAStream();
     static sm120_profile::KernelProfileCounter profile_counter(
         "sm120_fp8_fp8_cutlass");
     sm120_profile::ScopedTimer profile_timer(
         profile_counter, stream, m, n, k, 1);
-    fill_scale_kernel<<<static_cast<unsigned>((sfa_elems + 255) / 256), 256, 0,
-                        stream>>>(scratch.sfa, sfa_elems);
-    DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
-    fill_scale_kernel<<<static_cast<unsigned>((sfb_elems + 255) / 256), 256, 0,
-                        stream>>>(scratch.sfb, sfb_elems);
-    DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
+    if (cache_sfb) {
+        arguments.mainloop.ptr_SFB =
+            get_cached_sfb(device, sfb, sfb_type, m, n, k, k32, sfb_elems,
+                           gran_mn_b, gran_k_b, sfb.stride(0),
+                           sfb.stride(1), stream);
+    } else {
+        arguments.mainloop.ptr_SFB = scratch.sfb;
+        fill_scale_kernel<<<static_cast<unsigned>((sfb_elems + 255) / 256),
+                            256, 0, stream>>>(scratch.sfb, sfb_elems);
+        DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
+        const int sfb_total = n * k32;
+        convert_sfb_kernel<<<(sfb_total + 255) / 256, 256, 0, stream>>>(
+            sfb.data_ptr(), scratch.sfb, sfb_total, sfb_type, m, n, k, k32,
+            gran_mn_b, gran_k_b, sfb.stride(0), sfb.stride(1));
+        DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
+    }
+
+    const bool cache_sfa_fill =
+        env_flag_default_enabled("DG_SM120_CACHE_FP8_SFA_FILL");
+    const bool need_sfa_prefill =
+        !cache_sfa_fill || !scratch.sfa_prefilled ||
+        scratch.sfa_prefill_m != m || scratch.sfa_prefill_n != n ||
+        scratch.sfa_prefill_k != k ||
+        scratch.sfa_prefill_elems != sfa_elems;
+    if (need_sfa_prefill) {
+        fill_scale_kernel<<<static_cast<unsigned>((sfa_elems + 255) / 256),
+                            256, 0, stream>>>(scratch.sfa, sfa_elems);
+        DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
+        scratch.sfa_prefilled = cache_sfa_fill;
+        scratch.sfa_prefill_m = m;
+        scratch.sfa_prefill_n = n;
+        scratch.sfa_prefill_k = k;
+        scratch.sfa_prefill_elems = sfa_elems;
+    }
 
     const int sfa_total = m * k32;
     convert_sfa_kernel<<<(sfa_total + 255) / 256, 256, 0, stream>>>(
-        sfa.data_ptr(), scratch.sfa, sfa_total, scale_tensor_type(sfa), m, n, k,
-        k32, gran_mn_a, gran_k_a, sfa.stride(0), sfa.stride(1));
-    DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
-
-    const int sfb_total = n * k32;
-    convert_sfb_kernel<<<(sfb_total + 255) / 256, 256, 0, stream>>>(
-        sfb.data_ptr(), scratch.sfb, sfb_total, scale_tensor_type(sfb), m, n, k,
-        k32, gran_mn_b, gran_k_b, sfb.stride(0), sfb.stride(1));
+        sfa.data_ptr(), scratch.sfa, sfa_total, sfa_type, m, n, k, k32,
+        gran_mn_a, gran_k_a, sfa.stride(0), sfa.stride(1));
     DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
 
     Gemm gemm_op;

@@ -7,7 +7,8 @@ namespace deep_gemm::sm120_moe {
 
 torch::Tensor sm120_silu_mul_quant_fp8_packed(const torch::Tensor& input,
                                               const torch::Tensor& output,
-                                              int64_t group_size);
+                                              int64_t group_size,
+                                              double clamp_limit = 0.0);
 
 void register_apis(pybind11::module& m);
 
