@@ -34,11 +34,15 @@ Blackwell workstation GPUs, which report compute capability SM120.
 - `DG_SM120_ACTIVE_HEADS=32`
 - `DG_SM120_SEQUENTIAL_COMPRESSOR=1`
 - `DG_SM120_ENABLE_B12X_MOE=0`
-- `DG_SM120_PREFILL_WORKSPACE_CHUNK=64`
+- `DG_SM120_PREFILL_WORKSPACE_CHUNK=16`
+- `DG_SM120_MOE_SKIP_SFA_FILL=1`
+- `DG_SM120_MOE_SKIP_SFA_FILL_MAX_M=16`
+- `DG_SM120_BYPASS_TP_ALLREDUCE=0`
+- `DG_SM120_MHC_REUSE_BUFFERS=0`
 
-Note: `docker/patch_vllm_deepseekv4.py` currently has an internal default of
-`DG_SM120_PREFILL_WORKSPACE_CHUNK=16`, but the compose environment overrides it
-to `64`. The running service was last validated with chunk `64`.
+Keep `DG_SM120_BYPASS_TP_ALLREDUCE=0` for valid output. Setting it to `1` is a
+diagnostic-only invalid-output path used to estimate tensor-parallel
+communication overhead.
 
 ## What Has Been Implemented
 
@@ -59,6 +63,15 @@ to `64`. The running service was last validated with chunk `64`.
 - Sparse-indexer behavior is patched for SM120 and small/full-context shapes.
 - DeepSeek V4 compressor scheduling is patched to avoid first-request OOM.
 - Optional layer and kernel profiling hooks exist but are off by default.
+- SM120 attention now avoids padding Q from 32 local heads to the native
+  FlashMLA 64-head requirement. The patched layer accepts the existing padded
+  output buffer while passing the unpadded Q tensor to SM120 fallback kernels.
+- Optional mHC buffer reuse exists behind `DG_SM120_MHC_REUSE_BUFFERS=1`, but
+  remains off by default because it helped synthetic `mhc_pre` microbenchmarks
+  and did not improve end-to-end token generation.
+- Optional tensor-parallel allreduce bypass exists behind
+  `DG_SM120_BYPASS_TP_ALLREDUCE=1`. It is invalid for real serving and should
+  only be used for profiling communication overhead.
 
 ### DeepGEMM Extension Work
 
@@ -78,6 +91,13 @@ Important implemented paths:
 - SM120 C128 FP8 decode/projection support sufficient for functional serving.
 - SM120 FP8 `bhr,hdr->bhd` einsum path for the DeepSeek V4 output projection.
 - SM120 sparse MLA decode kernels, including BF16 workspace variants.
+- SM120 BHR `bhr,hdr->bhd` dispatch now uses the warp-column path for
+  decode-sized shapes (`R <= 512`, `D <= 2048`, `B*H <= 64`) as well as longer
+  contexts.
+- SM120 CUTLASS MoE scale-fill skipping is now size-gated:
+  `DG_SM120_MOE_SKIP_SFA_FILL=1` skips compact SFA fill only for
+  `m <= DG_SM120_MOE_SKIP_SFA_FILL_MAX_M` by default. This keeps the small-M
+  decode microbench win without hurting larger batched shapes.
 - SM120 sparse MLA prefill from BF16 workspace:
   - exported as `deep_gemm._C.sm120_sparse_mla_prefill_from_bf16_workspace`
   - validated synthetically for BF16 tolerance
@@ -109,13 +129,23 @@ Useful scripts include:
   - `--kv-cache-memory-bytes 8589934592`
 - CUDA graph capture works with the current non-eager configuration.
 - Parallel serving works better than single-request serving:
-  - earlier 512-token decode tests reached roughly `140 tok/s` aggregate at
+  - recent 512-token decode tests reached roughly `145 tok/s` aggregate at
     concurrency `4`
-  - single request remained around `60-65 tok/s` decode-only in the best tests
+  - single request remained around `66-67 tok/s` after warmup
 - C128 FP8 M=1 projection microbenchmarks improved substantially after the
   contiguous UE8M0 k-block specialization:
   - example projection shapes improved from roughly `18-25 us` to `14-18 us`
   - this did not translate into a large end-to-end speedup
+- The SM120 no-Q-padding patch is valid and keeps the service working, but only
+  moved end-to-end single-request throughput by a very small amount.
+- The size-gated MoE SFA-fill heuristic is correct in microbenchmarks:
+  - `m=1`: `skip_fill` about `24.7 us` vs default about `26.8 us`
+  - `m=64`: unconditional `skip_fill` was worse, so the default gate is `m<=16`
+  - end-to-end API throughput barely moved, so this is not the missing
+    `100+ tok/s` lever
+- TP allreduce is not the main bottleneck:
+  - diagnostic invalid-output bypass only improved warmed single-request
+    throughput by roughly `4%`
 - Native SM120 sparse MLA prefill op compiled and passed synthetic checks:
   - BF16 output max error around `0.0039-0.0078`
   - LSE max error around `4.8e-7`
@@ -171,9 +201,8 @@ Useful scripts include:
   - around `4.1k` prompt tokens: `13.2s` TTFT -> `11.3s`
   - around `8.2k` prompt tokens: `28.7s` TTFT -> `24.3s`
   - around `16.4k` prompt tokens: `62-64s` TTFT -> `55.8s`
-- Synthetic chunk sweep suggested chunk `16` may be faster than chunk `64`, but
-  this has not been validated end-to-end because the running compose default
-  still overrides to `64`.
+- Synthetic chunk sweep suggested chunk `16` may be faster than chunk `64`, and
+  compose now defaults to chunk `16`.
   - chunk `16` was best in one synthetic sweep for `S=512,H=64,K=2048`
   - larger chunks reduce Python/operator loop count but increase gathered
     workspace pressure and were not consistently faster
@@ -195,11 +224,15 @@ Useful scripts include:
     experiments here
   - rebuilding vLLM is unlikely by itself to fix performance unless it includes
     new compiled FlashMLA/CUDA kernels
-- A vLLM profiler restart attempt failed due to invalid profiler CLI key names.
-  Retry with a valid JSON `--profiler-config` if profiling is needed.
+- vLLM profiler restarts are risky and should be done only when the API can be
+  down for a while.
+  - one attempt failed because `VLLM_EXTRA_ARGS` expanded JSON without quoting,
+    producing invalid `{profiler:torch,...}` input to vLLM
+  - `docker-compose.yml` now has `VLLM_PROFILER_CONFIG_JSON` to pass
+    `--profiler-config` as one quoted argument, but this path still needs a
+    clean validation run
   - dotted kebab-case CLI keys like
     `--profiler-config.torch-profiler-dir` were rejected
-  - use a single JSON config string if trying again
   - avoid enabling `DG_SM120_KERNEL_PROFILE` while CUDA graph capture is active
     unless you intend to benchmark with synchronization overhead
 - Optional b12x MoE integration exists behind `DG_SM120_ENABLE_B12X_MOE=1` but
@@ -229,6 +262,20 @@ The second likely bottleneck is sparse MLA decode and MoE decode efficiency.
 The current implementation still contains fallback/workspace-heavy paths that
 are functional but not production-grade.
 
+## Recent Delta Since Last Commit
+
+- Added the SM120 no-Q-padding vLLM patch. This removes one per-layer padding
+  launch/copy for Q on SM120 while preserving padded output-buffer compatibility.
+- Added default-off `DG_SM120_MHC_REUSE_BUFFERS` support in the vLLM patcher.
+  Keep it off unless re-testing mHC allocation reuse.
+- Added default-off `DG_SM120_BYPASS_TP_ALLREDUCE` support for diagnostics.
+  Never use it for valid output.
+- Extended the BHR warp-column heuristic to short decode shapes.
+- Changed MoE compact SFA-fill skipping to be gated by
+  `DG_SM120_MOE_SKIP_SFA_FILL_MAX_M`.
+- Added `VLLM_PROFILER_CONFIG_JSON` compose plumbing for quoted profiler config.
+  This was added after an unquoted profiler restart broke startup.
+
 ## Next Work
 
 1. Build a production SM120 sparse MLA prefill kernel.
@@ -236,9 +283,8 @@ are functional but not production-grade.
    directly from FP8 MLA cache plus sparse indices where possible.
 
 2. Validate `DG_SM120_PREFILL_WORKSPACE_CHUNK=16` end-to-end.
-   The code default is now `16`, but compose currently exports `64`. Change one
-   source of truth, restart once, and measure token-counted TTFT for about
-   `4k`, `8k`, and `16k` uncached prompt tokens.
+   Compose now defaults to `16`; measure token-counted TTFT for about `4k`,
+   `8k`, and `16k` uncached prompt tokens.
 
 3. Replace workspace-heavy sparse MLA decode with direct SM120 tensor-core
    computation.
@@ -247,6 +293,8 @@ are functional but not production-grade.
 
 4. Profile the live prefill path with valid vLLM profiler config.
    Use unique prompts from token 0 so prefix caching does not hide TTFT.
+   Prefer `VLLM_PROFILER_CONFIG_JSON='{"profiler":"torch",...}'` over
+   `VLLM_EXTRA_ARGS` so JSON is passed as one argument.
 
 5. Revisit the C128 decode/MoE path after prefill is fixed.
    The C128 projection microbench improved, but end-to-end did not. The
@@ -306,3 +354,5 @@ docker compose exec -T vllm bash -lc \
   so the warnings are noisy but expected.
 - Keep `DG_SM120_KERNEL_PROFILE=0` for real benchmarks. The kernel profiler uses
   CUDA event synchronization and will distort throughput when enabled.
+- Keep `DG_SM120_BYPASS_TP_ALLREDUCE=0` for real benchmarks. The bypass is
+  deliberately invalid and only measures how much TP allreduce costs.

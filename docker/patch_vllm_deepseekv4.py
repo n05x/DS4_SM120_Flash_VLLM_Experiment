@@ -2147,6 +2147,52 @@ def patch_deepseek_v4_sm120_compressor_overlap() -> None:
         if end < 0:
             break
         source = source[:second] + source[end + 2 :]
+
+    old_q_pad = '''        # Pad q to FlashMLA-required head count (64 or 128)
+        if self.n_local_heads < self.padded_heads:
+            pad_size = self.padded_heads - self.n_local_heads
+            q = F.pad(q, (0, 0, 0, pad_size), value=0.0)
+'''
+    new_q_pad = '''        # Native FlashMLA requires 64/128 heads. The SM120 fallback kernels
+        # use DG_SM120_ACTIVE_HEADS and can write only the real local heads into
+        # the preallocated padded output, so avoid a per-layer F.pad launch.
+        if self.n_local_heads < self.padded_heads and not (
+            q.is_cuda and torch.cuda.get_device_capability(q.device)[0] >= 12
+        ):
+            pad_size = self.padded_heads - self.n_local_heads
+            q = F.pad(q, (0, 0, 0, pad_size), value=0.0)
+'''
+    if old_q_pad in source:
+        source = source.replace(old_q_pad, new_q_pad, 1)
+    elif (
+        "DG_SM120_ACTIVE_HEADS" not in source
+        and "avoid a per-layer F.pad launch" not in source
+    ):
+        raise RuntimeError(f"Could not patch SM120 q padding in {path}")
+
+    old_output_assert = '''        assert output.shape == q.shape, (
+            f"output buffer shape {output.shape} must match q shape {q.shape}"
+        )
+'''
+    new_output_assert = '''        sm120_padded_output = (
+            q.is_cuda
+            and torch.cuda.get_device_capability(q.device)[0] >= 12
+            and output.dim() == q.dim()
+            and output.shape[0] == q.shape[0]
+            and output.shape[1] >= q.shape[1]
+            and output.shape[2:] == q.shape[2:]
+        )
+        assert output.shape == q.shape or sm120_padded_output, (
+            f"output buffer shape {output.shape} must match q shape {q.shape}"
+        )
+'''
+    if old_output_assert in source:
+        source = source.replace(old_output_assert, new_output_assert, 1)
+    elif (
+        "sm120_padded_output" not in source
+        and "must match q shape" in source
+    ):
+        raise RuntimeError(f"Could not patch SM120 output assert in {path}")
     path.write_text(source)
 
 
@@ -2427,6 +2473,176 @@ def patch_deepseek_v4_layer_profiler() -> None:
 '''
     if old not in source:
         raise RuntimeError(f"Could not patch DeepSeek V4 layer profiler in {path}")
+    path.write_text(source.replace(old, new, 1))
+
+
+def patch_mhc_reusable_buffers() -> None:
+    path = Path("/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/mhc.py")
+    source = path.read_text()
+    if "DG_SM120_MHC_REUSE_BUFFERS" in source:
+        source = source.replace(
+            'os.environ.get("DG_SM120_MHC_REUSE_BUFFERS", "1")',
+            'os.environ.get("DG_SM120_MHC_REUSE_BUFFERS", "0")',
+        )
+        path.write_text(source)
+        return
+
+    if "import os\n" not in source:
+        source = source.replace("import math\n", "import math\nimport os\n", 1)
+
+    marker = "\n\ndef mhc_pre(\n"
+    helper = r'''
+
+_DG_SM120_MHC_PRE_BUFFERS: dict[tuple, tuple[torch.Tensor, ...]] = {}
+
+
+def _dg_sm120_mhc_pre_buffers(
+    num_tokens: int,
+    hc_mult: int,
+    hc_mult2: int,
+    hc_mult3: int,
+    hidden_size: int,
+    n_splits: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    key = (
+        device.type,
+        device.index,
+        num_tokens,
+        hc_mult,
+        hidden_size,
+        n_splits,
+    )
+    cached = _DG_SM120_MHC_PRE_BUFFERS.get(key)
+    if cached is not None:
+        return cached  # type: ignore[return-value]
+
+    post_mix = torch.empty(num_tokens, hc_mult, dtype=torch.float32, device=device)
+    comb_mix = torch.empty(num_tokens, hc_mult2, dtype=torch.float32, device=device)
+    layer_input = torch.empty(
+        num_tokens, hidden_size, dtype=torch.bfloat16, device=device
+    )
+    gemm_out_mul = torch.empty(
+        n_splits, num_tokens, hc_mult3, dtype=torch.float32, device=device
+    )
+    gemm_out_sqrsum = torch.empty(
+        n_splits, num_tokens, dtype=torch.float32, device=device
+    )
+    cached = (post_mix, comb_mix, layer_input, gemm_out_mul, gemm_out_sqrsum)
+    _DG_SM120_MHC_PRE_BUFFERS[key] = cached
+    return cached
+'''
+    if marker not in source:
+        raise RuntimeError(f"Could not find mhc_pre marker in {path}")
+    source = source.replace(marker, helper + marker, 1)
+
+    old = '''    post_mix = torch.empty(
+        num_tokens,
+        hc_mult,
+        dtype=torch.float32,
+        device=residual.device,
+    )
+    comb_mix = torch.empty(
+        num_tokens,
+        hc_mult2,
+        dtype=torch.float32,
+        device=residual.device,
+    )
+    layer_input = torch.empty(
+        num_tokens,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device=residual.device,
+    )
+
+    gemm_out_mul = torch.empty(
+        n_splits,
+        num_tokens,
+        hc_mult3,
+        dtype=torch.float32,
+        device=residual.device,
+    )
+    gemm_out_sqrsum = torch.empty(
+        n_splits,
+        num_tokens,
+        dtype=torch.float32,
+        device=residual.device,
+    )
+'''
+    new = '''    if os.environ.get("DG_SM120_MHC_REUSE_BUFFERS", "0") != "0":
+        post_mix, comb_mix, layer_input, gemm_out_mul, gemm_out_sqrsum = (
+            _dg_sm120_mhc_pre_buffers(
+                num_tokens,
+                hc_mult,
+                hc_mult2,
+                hc_mult3,
+                hidden_size,
+                n_splits,
+                residual.device,
+            )
+        )
+    else:
+        post_mix = torch.empty(
+            num_tokens,
+            hc_mult,
+            dtype=torch.float32,
+            device=residual.device,
+        )
+        comb_mix = torch.empty(
+            num_tokens,
+            hc_mult2,
+            dtype=torch.float32,
+            device=residual.device,
+        )
+        layer_input = torch.empty(
+            num_tokens,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=residual.device,
+        )
+
+        gemm_out_mul = torch.empty(
+            n_splits,
+            num_tokens,
+            hc_mult3,
+            dtype=torch.float32,
+            device=residual.device,
+        )
+        gemm_out_sqrsum = torch.empty(
+            n_splits,
+            num_tokens,
+            dtype=torch.float32,
+            device=residual.device,
+        )
+'''
+    if old not in source:
+        raise RuntimeError(f"Could not patch MHC pre allocations in {path}")
+    path.write_text(source.replace(old, new, 1))
+
+
+def patch_tp_allreduce_diagnostic_bypass() -> None:
+    path = Path("/usr/local/lib/python3.12/dist-packages/vllm/distributed/communication_op.py")
+    source = path.read_text()
+    if "DG_SM120_BYPASS_TP_ALLREDUCE" in source:
+        return
+    if "import os\n" not in source:
+        source = source.replace(
+            "from typing import Any\n",
+            "from typing import Any\n\nimport os\n",
+            1,
+        )
+    old = '''def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+    """All-reduce the input tensor across model parallel group."""
+    return get_tp_group().all_reduce(input_)
+'''
+    new = '''def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+    """All-reduce the input tensor across model parallel group."""
+    if os.environ.get("DG_SM120_BYPASS_TP_ALLREDUCE", "0") != "0":
+        return input_
+    return get_tp_group().all_reduce(input_)
+'''
+    if old not in source:
+        raise RuntimeError(f"Could not patch tensor_model_parallel_all_reduce in {path}")
     path.write_text(source.replace(old, new, 1))
 
 
@@ -2818,5 +3034,7 @@ patch_sm120_sparse_indexer_graph_safe_topk()
 patch_sm120_sparse_indexer_full_context_decode()
 patch_deepseek_v4_sm120_compressor_overlap()
 patch_deepseek_v4_cache_gather_bounds()
+patch_mhc_reusable_buffers()
+patch_tp_allreduce_diagnostic_bypass()
 if __import__("os").environ.get("DG_SM120_INSTALL_PROFILE_PATCH", "0") == "1":
     patch_deepseek_v4_layer_profiler()

@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <type_traits>
 #include <unordered_map>
@@ -153,6 +154,21 @@ bool env_flag_enabled(const char* name) {
     return value != nullptr && std::strcmp(value, "0") != 0 &&
            std::strcmp(value, "false") != 0 &&
            std::strcmp(value, "False") != 0;
+}
+
+int env_int_or_default(const char* name, int fallback) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || *value == '\0')
+        return fallback;
+    char* end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (end == value)
+        return fallback;
+    if (parsed < std::numeric_limits<int>::min())
+        return std::numeric_limits<int>::min();
+    if (parsed > std::numeric_limits<int>::max())
+        return std::numeric_limits<int>::max();
+    return static_cast<int>(parsed);
 }
 
 Scratch& get_scratch(int device, int num_groups, size_t sfa_bytes, size_t workspace_bytes) {
@@ -757,7 +773,12 @@ bool sm120_m_grouped_fp8_fp4_gemm_nt_contiguous_cutlass_impl(
     if (compact_active_groups) {
         const size_t compact_sfa_total =
             static_cast<size_t>(gemm_num_groups) * sfa_group_elems;
-        if (!env_flag_enabled("DG_SM120_MOE_SKIP_SFA_FILL")) {
+        const int skip_fill_max_m =
+            env_int_or_default("DG_SM120_MOE_SKIP_SFA_FILL_MAX_M", 16);
+        const bool skip_sfa_fill =
+            env_flag_enabled("DG_SM120_MOE_SKIP_SFA_FILL") &&
+            (skip_fill_max_m < 0 || m <= skip_fill_max_m);
+        if (!skip_sfa_fill) {
             fill_scale_kernel<<<static_cast<unsigned>((compact_sfa_total + 255) / 256), 256, 0, stream>>>(
                 scratch.sfa_ue8, compact_sfa_total);
             DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
