@@ -165,6 +165,23 @@ __global__ void fill_scale_kernel(ElementSF* __restrict__ out, size_t total) {
         out[idx] = ElementSF(1.0f);
 }
 
+void fill_scale_async(ElementSF* out, size_t total, cudaStream_t stream) {
+    if (total == 0)
+        return;
+    if (env_flag_default_enabled("DG_SM120_USE_MEMSET_SCALE_FILL")) {
+        // UE8M0 encodes 1.0 as exponent 127 (0x7f).  The padding entries in
+        // CUTLASS' block-scale layouts only need the neutral multiplier, so a
+        // byte memset avoids launching a separate fill kernel on every small-M
+        // dense projection shape.
+        cuda_check(cudaMemsetAsync(out, 0x7f, sizeof(ElementSF) * total,
+                                   stream));
+        return;
+    }
+    fill_scale_kernel<<<static_cast<unsigned>((total + 255) / 256), 256, 0,
+                        stream>>>(out, total);
+    DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
+}
+
 __device__ __forceinline__ uint8_t load_ue8m0_raw(const int32_t* scale,
                                                   int64_t base,
                                                   int64_t stride_last,
@@ -261,9 +278,7 @@ ElementSF* get_cached_sfb(int device, const torch::Tensor& sfb, int scale_type,
     cuda_check(cudaMalloc(reinterpret_cast<void**>(&entry.data),
                           sizeof(ElementSF) * sfb_elems));
 
-    fill_scale_kernel<<<static_cast<unsigned>((sfb_elems + 255) / 256), 256, 0,
-                        stream>>>(entry.data, sfb_elems);
-    DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
+    fill_scale_async(entry.data, sfb_elems, stream);
     const int sfb_total = n * k32;
     convert_sfb_kernel<<<(sfb_total + 255) / 256, 256, 0, stream>>>(
         sfb.data_ptr(), entry.data, sfb_total, scale_type, m, n, k, k32,
@@ -479,9 +494,7 @@ bool sm120_fp8_fp8_gemm_nt_cutlass(
                            sfb.stride(1), stream);
     } else {
         arguments.mainloop.ptr_SFB = scratch.sfb;
-        fill_scale_kernel<<<static_cast<unsigned>((sfb_elems + 255) / 256),
-                            256, 0, stream>>>(scratch.sfb, sfb_elems);
-        DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
+        fill_scale_async(scratch.sfb, sfb_elems, stream);
         const int sfb_total = n * k32;
         convert_sfb_kernel<<<(sfb_total + 255) / 256, 256, 0, stream>>>(
             sfb.data_ptr(), scratch.sfb, sfb_total, sfb_type, m, n, k, k32,
@@ -497,9 +510,7 @@ bool sm120_fp8_fp8_gemm_nt_cutlass(
         scratch.sfa_prefill_k != k ||
         scratch.sfa_prefill_elems != sfa_elems;
     if (need_sfa_prefill) {
-        fill_scale_kernel<<<static_cast<unsigned>((sfa_elems + 255) / 256),
-                            256, 0, stream>>>(scratch.sfa, sfa_elems);
-        DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
+        fill_scale_async(scratch.sfa, sfa_elems, stream);
         scratch.sfa_prefilled = cache_sfa_fill;
         scratch.sfa_prefill_m = m;
         scratch.sfa_prefill_n = n;

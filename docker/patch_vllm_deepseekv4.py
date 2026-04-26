@@ -714,6 +714,473 @@ def patch_deepseek_v4_attention() -> None:
     path.write_text(source)
 
 
+def patch_deepseek_v4_prefill_dynamic_compressed_workspace() -> None:
+    """Shrink DeepSeek V4 sparse-prefill C128 workspace/index width on SM120.
+
+    vLLM's C128 prefill path sizes the gathered workspace with
+    N=max_model_len/compress_ratio and passes the full padded C128 top-k width
+    into combine_topk_swa_indices. For a 128k model length this means each
+    modest 4k prompt still carries a 1024-wide compressed region even though the
+    prompt only has about 32 compressed C128 entries. The downstream SM120
+    prefill bridge can trim padded work, but by then vLLM has already allocated
+    and combined the oversized sparse-index rows.
+
+    For prefill only, compute a per-chunk compressed capacity from the chunk's
+    actual sequence lengths, round the C128 top-k width to FlashMLA's 128-entry
+    alignment, and allocate the gathered KV workspace with the smaller C128
+    offset. This is a broader sparse-prefill boundary reduction rather than a
+    single-token decode helper tweak.
+    """
+    path = Path(
+        "/usr/local/lib/python3.12/dist-packages/vllm/model_executor/"
+        "layers/deepseek_v4_attention.py"
+    )
+    source = path.read_text()
+    if "DG_SM120_PREFILL_DYNAMIC_COMPRESSED_N" in source:
+        old = """        kv = None
+        if not sm120_dynamic_compressed_n:
+            kv = workspace_manager.get_simultaneous(
+                ((PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+            )[0]
+        for chunk_idx in range(num_chunks):
+"""
+        new = """        kv = None
+        if not sm120_dynamic_compressed_n:
+            kv = workspace_manager.get_simultaneous(
+                ((PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+            )[0]
+        sm120_dynamic_chunk_ns = None
+        if sm120_dynamic_compressed_n:
+            sm120_dynamic_chunk_ns = getattr(
+                swa_metadata, "_sm120_dynamic_c128_chunk_ns", None
+            )
+            if sm120_dynamic_chunk_ns is None or len(sm120_dynamic_chunk_ns) != num_chunks:
+                chunk_seq_lens_cpu = getattr(
+                    swa_metadata, "prefill_seq_lens_cpu", None
+                )
+                chunk_ns = []
+                for _chunk_idx in range(num_chunks):
+                    _chunk_start = _chunk_idx * PREFILL_CHUNK_SIZE
+                    _chunk_end = min(_chunk_start + PREFILL_CHUNK_SIZE, num_prefills)
+                    if chunk_seq_lens_cpu is not None:
+                        _max_seq_len = int(
+                            chunk_seq_lens_cpu[_chunk_start:_chunk_end].max().item()
+                        )
+                    else:
+                        _max_seq_len = int(
+                            seq_lens[_chunk_start:_chunk_end].max().item()
+                        )
+                    _compressed = int(
+                        (_max_seq_len + self.compress_ratio - 1)
+                        // self.compress_ratio
+                    )
+                    chunk_ns.append(max(1, min(N, _compressed)))
+                sm120_dynamic_chunk_ns = tuple(chunk_ns)
+                setattr(
+                    swa_metadata,
+                    "_sm120_dynamic_c128_chunk_ns",
+                    sm120_dynamic_chunk_ns,
+                )
+        for chunk_idx in range(num_chunks):
+"""
+        if old in source:
+            source = source.replace(old, new, 1)
+        old = """                chunk_seq_lens_cpu = getattr(
+                    swa_metadata, "prefill_seq_lens_cpu", None
+                )
+                if chunk_seq_lens_cpu is not None:
+                    chunk_max_seq_len = int(
+                        chunk_seq_lens_cpu[chunk_start:chunk_end].max().item()
+                    )
+                else:
+                    chunk_max_seq_len = int(
+                        seq_lens[chunk_start:chunk_end].max().item()
+                    )
+                chunk_compressed = int(
+                    (chunk_max_seq_len + self.compress_ratio - 1)
+                    // self.compress_ratio
+                )
+                chunk_N = max(1, min(N, chunk_compressed))
+"""
+        new = """                assert sm120_dynamic_chunk_ns is not None
+                chunk_N = sm120_dynamic_chunk_ns[chunk_idx]
+"""
+        if old in source:
+            source = source.replace(old, new, 1)
+        path.write_text(source)
+        return
+
+    old = """        M = N + self.window_size + self.max_num_batched_tokens
+        num_chunks = (num_prefills + PREFILL_CHUNK_SIZE - 1) // PREFILL_CHUNK_SIZE
+
+        workspace_manager = current_workspace_manager()
+        kv = workspace_manager.get_simultaneous(
+            ((PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+        )[0]
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * PREFILL_CHUNK_SIZE
+            chunk_end = min(chunk_start + PREFILL_CHUNK_SIZE, num_prefills)
+            chunk_size = chunk_end - chunk_start
+            if not swa_only:
+                # Gather compressed KV
+                assert attn_metadata is not None
+                block_table = attn_metadata.block_table[num_decodes:]
+                dequantize_and_gather_k_cache(
+                    kv[:chunk_size],
+                    compressed_k_cache,
+                    seq_lens=seq_lens[chunk_start:chunk_end] // self.compress_ratio,
+                    gather_lens=None,
+                    block_table=block_table[chunk_start:chunk_end],
+                    block_size=attn_metadata.block_size // self.compress_ratio,
+                    offset=0,
+                )
+
+            # Gather SWA KV
+            swa_block_table = swa_metadata.block_table[num_decodes:]
+            dequantize_and_gather_k_cache(
+                kv[:chunk_size],
+                swa_k_cache,
+                seq_lens=seq_lens[chunk_start:chunk_end],
+                gather_lens=gather_lens[chunk_start:chunk_end],
+                block_table=swa_block_table[chunk_start:chunk_end],
+                block_size=swa_metadata.block_size,
+                offset=N,
+            )
+
+            # Combine the topk indices and SWA indices for gathered KV cache
+            query_start = (
+                query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
+            )
+            query_end = (
+                query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
+            )
+
+            combined_indices, combined_lens = combine_topk_swa_indices(
+                topk_indices[query_start:query_end],
+                query_start_loc[
+                    num_decodes + chunk_start : num_decodes + chunk_end + 1
+                ],
+                seq_lens[chunk_start:chunk_end],
+                gather_lens[chunk_start:chunk_end],
+                self.window_size,
+                self.compress_ratio,
+                top_k,
+                M,
+                N,
+            )
+"""
+    new = """        M = N + self.window_size + self.max_num_batched_tokens
+        num_chunks = (num_prefills + PREFILL_CHUNK_SIZE - 1) // PREFILL_CHUNK_SIZE
+
+        workspace_manager = current_workspace_manager()
+        sm120_dynamic_compressed_n = (
+            (not swa_only)
+            and self.compress_ratio == 128
+            and q.is_cuda
+            and torch.cuda.get_device_capability(q.device)[0] >= 12
+            and __import__("os").environ.get(
+                "DG_SM120_PREFILL_DYNAMIC_COMPRESSED_N", "1"
+            )
+            != "0"
+        )
+        kv = None
+        if not sm120_dynamic_compressed_n:
+            kv = workspace_manager.get_simultaneous(
+                ((PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+            )[0]
+        sm120_dynamic_chunk_ns = None
+        if sm120_dynamic_compressed_n:
+            sm120_dynamic_chunk_ns = getattr(
+                swa_metadata, "_sm120_dynamic_c128_chunk_ns", None
+            )
+            if sm120_dynamic_chunk_ns is None or len(sm120_dynamic_chunk_ns) != num_chunks:
+                chunk_seq_lens_cpu = getattr(
+                    swa_metadata, "prefill_seq_lens_cpu", None
+                )
+                chunk_ns = []
+                for _chunk_idx in range(num_chunks):
+                    _chunk_start = _chunk_idx * PREFILL_CHUNK_SIZE
+                    _chunk_end = min(_chunk_start + PREFILL_CHUNK_SIZE, num_prefills)
+                    if chunk_seq_lens_cpu is not None:
+                        _max_seq_len = int(
+                            chunk_seq_lens_cpu[_chunk_start:_chunk_end].max().item()
+                        )
+                    else:
+                        _max_seq_len = int(
+                            seq_lens[_chunk_start:_chunk_end].max().item()
+                        )
+                    _compressed = int(
+                        (_max_seq_len + self.compress_ratio - 1)
+                        // self.compress_ratio
+                    )
+                    chunk_ns.append(max(1, min(N, _compressed)))
+                sm120_dynamic_chunk_ns = tuple(chunk_ns)
+                setattr(
+                    swa_metadata,
+                    "_sm120_dynamic_c128_chunk_ns",
+                    sm120_dynamic_chunk_ns,
+                )
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * PREFILL_CHUNK_SIZE
+            chunk_end = min(chunk_start + PREFILL_CHUNK_SIZE, num_prefills)
+            chunk_size = chunk_end - chunk_start
+
+            # Combine/gather works on a chunk-local query window.
+            query_start = (
+                query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
+            )
+            query_end = (
+                query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
+            )
+
+            chunk_N = N
+            chunk_M = M
+            chunk_top_k = top_k
+            chunk_topk_indices = topk_indices[query_start:query_end]
+            if sm120_dynamic_compressed_n:
+                # Per-chunk actual C128 compressed capacity.  Round the sparse
+                # top-k width to the same 128-entry alignment used by FlashMLA
+                # sparse prefill, but keep the SWA offset tight so the gathered
+                # workspace does not reserve the whole 128k-context C128 pool.
+                assert sm120_dynamic_chunk_ns is not None
+                chunk_N = sm120_dynamic_chunk_ns[chunk_idx]
+                chunk_top_k = max(1, min(top_k, ((chunk_N + 127) // 128) * 128))
+                chunk_topk_indices = topk_indices[
+                    query_start:query_end, :chunk_top_k
+                ]
+                chunk_M = chunk_N + self.window_size + self.max_num_batched_tokens
+                kv = workspace_manager.get_simultaneous(
+                    ((PREFILL_CHUNK_SIZE, chunk_M, q.shape[-1]), torch.bfloat16),
+                )[0]
+            assert kv is not None
+
+            if not swa_only:
+                # Gather compressed KV
+                assert attn_metadata is not None
+                block_table = attn_metadata.block_table[num_decodes:]
+                dequantize_and_gather_k_cache(
+                    kv[:chunk_size],
+                    compressed_k_cache,
+                    seq_lens=seq_lens[chunk_start:chunk_end] // self.compress_ratio,
+                    gather_lens=None,
+                    block_table=block_table[chunk_start:chunk_end],
+                    block_size=attn_metadata.block_size // self.compress_ratio,
+                    offset=0,
+                )
+
+            # Gather SWA KV
+            swa_block_table = swa_metadata.block_table[num_decodes:]
+            dequantize_and_gather_k_cache(
+                kv[:chunk_size],
+                swa_k_cache,
+                seq_lens=seq_lens[chunk_start:chunk_end],
+                gather_lens=gather_lens[chunk_start:chunk_end],
+                block_table=swa_block_table[chunk_start:chunk_end],
+                block_size=swa_metadata.block_size,
+                offset=chunk_N,
+            )
+
+            combined_indices, combined_lens = combine_topk_swa_indices(
+                chunk_topk_indices,
+                query_start_loc[
+                    num_decodes + chunk_start : num_decodes + chunk_end + 1
+                ],
+                seq_lens[chunk_start:chunk_end],
+                gather_lens[chunk_start:chunk_end],
+                self.window_size,
+                self.compress_ratio,
+                chunk_top_k,
+                chunk_M,
+                chunk_N,
+            )
+"""
+    if old not in source:
+        raise RuntimeError(
+            f"Could not patch DeepSeek V4 dynamic prefill C128 workspace in {path}"
+        )
+    source = source.replace(old, new, 1)
+    path.write_text(source)
+
+
+def patch_deepseek_v4_combine_topk_swa_empty_indices() -> None:
+    """Avoid clearing unused sparse-prefill combined-index tails on SM120.
+
+    combine_topk_swa_indices allocates a padded [tokens, topk + window] matrix
+    with torch.full(..., -1), then the Triton kernel overwrites only the valid
+    prefix and separately returns combined_lens. The SM120 prefill bridge masks
+    by combined_lens/topk_length before attention, so clearing the unused tail is
+    wasted per-layer work. Keep an env-gated fallback to the upstream fill for
+    quick correctness isolation.
+    """
+    path = Path(
+        "/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/"
+        "deepseek_v4_ops/cache_utils.py"
+    )
+    source = path.read_text()
+    if "DG_SM120_PREFILL_EMPTY_COMBINED_INDICES" in source:
+        return
+
+    old = """    combined_indices = torch.full(
+        (num_tokens, combined_topk),
+        fill_value=-1,
+        dtype=torch.int32,
+        device=topk_indices.device,
+    )
+"""
+    new = """    sm120_empty_combined_indices = (
+        topk_indices.is_cuda
+        and torch.cuda.get_device_capability(topk_indices.device)[0] >= 12
+        and __import__("os").environ.get(
+            "DG_SM120_PREFILL_EMPTY_COMBINED_INDICES", "1"
+        )
+        != "0"
+    )
+    if sm120_empty_combined_indices:
+        combined_indices = torch.empty(
+            (num_tokens, combined_topk),
+            dtype=torch.int32,
+            device=topk_indices.device,
+        )
+    else:
+        combined_indices = torch.full(
+            (num_tokens, combined_topk),
+            fill_value=-1,
+            dtype=torch.int32,
+            device=topk_indices.device,
+        )
+"""
+    if old not in source:
+        raise RuntimeError(f"Could not patch combine_topk_swa_indices in {path}")
+    source = source.replace(old, new, 1)
+    path.write_text(source)
+
+
+def patch_deepseek_v4_direct_fp8_prefill_map() -> None:
+    """Add an opt-in direct FP8 sparse-prefill path for SM120.
+
+    The default path gathers compressed + SWA FP8 KV cache rows into a BF16
+    workspace before sparse attention.  This patch keeps the proven BF16 path
+    as default, but adds a larger-boundary experiment that builds a compact
+    int32 workspace-row -> physical-cache-row map and runs sparse prefill
+    directly from the FP8 caches.  It is intentionally env-gated because the
+    first scalar direct kernel may lose to tensor-core BMM on some shapes; the
+    value is validating/removing the BF16 materialization boundary.
+    """
+    path = Path(
+        "/usr/local/lib/python3.12/dist-packages/vllm/model_executor/"
+        "layers/deepseek_v4_attention.py"
+    )
+    source = path.read_text()
+    if "DG_SM120_PREFILL_DIRECT_FP8_MAP" in source:
+        return
+
+    old = """            output_chunk, _, _ = flash_mla_sparse_fwd(
+                q=q[query_start:query_end],
+                kv=kv.view(-1, 1, q.shape[-1]),
+                indices=combined_indices.unsqueeze(1),
+                sm_scale=self.scale,
+                attn_sink=self.attn_sink,
+                topk_length=combined_lens,
+                out=output[query_start:query_end],
+            )
+"""
+    new = """            output_chunk = None
+            sm120_direct_fp8_prefill = (
+                (not swa_only)
+                and attn_metadata is not None
+                and q.is_cuda
+                and torch.cuda.get_device_capability(q.device)[0] >= 12
+                and __import__("os").environ.get(
+                    "DG_SM120_PREFILL_DIRECT_FP8_MAP", "0"
+                )
+                != "0"
+            )
+            if sm120_direct_fp8_prefill:
+                try:
+                    import deep_gemm
+
+                    dg_c = getattr(deep_gemm, "_C", None)
+                    build_strided_map = getattr(
+                        dg_c, "sm120_build_prefill_strided_workspace_map", None
+                    )
+                    direct_prefill = getattr(
+                        dg_c, "sm120_sparse_mla_prefill_from_two_fp8_workspace_map", None
+                    )
+                    if build_strided_map is not None and direct_prefill is not None:
+                        rows = int(chunk_size * chunk_M)
+                        map_cache = getattr(self, "_dg_sm120_prefill_direct_map", None)
+                        if (
+                            map_cache is None
+                            or map_cache.device != q.device
+                            or map_cache.numel() < rows
+                        ):
+                            map_cache = torch.empty(
+                                (rows,), device=q.device, dtype=torch.int32
+                            )
+                            setattr(self, "_dg_sm120_prefill_direct_map", map_cache)
+                        workspace_map = map_cache[:rows]
+                        workspace_map.fill_(-1)
+                        compressed_block_table = attn_metadata.block_table[num_decodes:][
+                            chunk_start:chunk_end
+                        ]
+                        build_strided_map(
+                            workspace_map,
+                            compressed_block_table,
+                            seq_lens[chunk_start:chunk_end] // self.compress_ratio,
+                            None,
+                            attn_metadata.block_size // self.compress_ratio,
+                            chunk_M,
+                            0,
+                            False,
+                        )
+                        build_strided_map(
+                            workspace_map,
+                            swa_block_table[chunk_start:chunk_end],
+                            seq_lens[chunk_start:chunk_end],
+                            gather_lens[chunk_start:chunk_end],
+                            swa_metadata.block_size,
+                            chunk_M,
+                            chunk_N,
+                            True,
+                        )
+                        output_chunk, _, _ = direct_prefill(
+                            q[query_start:query_end],
+                            compressed_k_cache.view(torch.uint8).unsqueeze(-2),
+                            swa_k_cache.view(torch.uint8).unsqueeze(-2),
+                            workspace_map,
+                            combined_indices.unsqueeze(1),
+                            combined_lens,
+                            self.attn_sink,
+                            attn_metadata.block_size // self.compress_ratio,
+                            swa_metadata.block_size,
+                            q.shape[-1],
+                            self.scale,
+                            output[query_start:query_end],
+                        )
+                except Exception:
+                    if __import__("os").environ.get(
+                        "DG_SM120_PREFILL_DIRECT_FP8_MAP_STRICT", "0"
+                    ) != "0":
+                        raise
+                    output_chunk = None
+
+            if output_chunk is None:
+                output_chunk, _, _ = flash_mla_sparse_fwd(
+                    q=q[query_start:query_end],
+                    kv=kv.view(-1, 1, q.shape[-1]),
+                    indices=combined_indices.unsqueeze(1),
+                    sm_scale=self.scale,
+                    attn_sink=self.attn_sink,
+                    topk_length=combined_lens,
+                    out=output[query_start:query_end],
+                )
+"""
+    if old not in source:
+        raise RuntimeError(f"Could not patch direct SM120 FP8 prefill map in {path}")
+    source = source.replace(old, new, 1)
+    path.write_text(source)
+
+
 def patch_flashmla_sparse_prefill() -> None:
     paths = (
         Path(
@@ -726,7 +1193,35 @@ def patch_flashmla_sparse_prefill() -> None:
         ),
     )
     marker = "def flash_mla_sparse_fwd(\n"
-    helper = '''def _sm120_flash_mla_sparse_prefill_fwd(
+    helper = '''_DG_SM120_PREFILL_COMPILED_BMM = None
+
+def _dg_sm120_prefill_torch_bmm(q_chunk, workspace, valid, valid_any, sink, sm_scale):
+    scores = torch.bmm(q_chunk, workspace.transpose(1, 2)).to(torch.float32)
+    scores.mul_(float(sm_scale))
+    scores.masked_fill_(~valid.unsqueeze(1), float("-inf"))
+    scores = torch.where(
+        valid_any.reshape(-1, 1, 1), scores, torch.zeros_like(scores)
+    )
+    chunk_lse = torch.logsumexp(scores, dim=-1)
+    probs = torch.softmax(scores, dim=-1).to(q_chunk.dtype)
+    probs.masked_fill_(~valid_any.reshape(-1, 1, 1), 0)
+    chunk_out = torch.bmm(probs, workspace)
+    gate = torch.sigmoid(chunk_lse - sink.to(chunk_lse.dtype).reshape(1, -1))
+    chunk_out = chunk_out * gate.to(chunk_out.dtype).unsqueeze(-1)
+    return chunk_out, chunk_lse
+
+def _dg_sm120_get_prefill_compiled_bmm():
+    global _DG_SM120_PREFILL_COMPILED_BMM
+    if _DG_SM120_PREFILL_COMPILED_BMM is None:
+        mode = __import__("os").environ.get(
+            "DG_SM120_PREFILL_TORCH_COMPILE_MODE", "reduce-overhead"
+        )
+        _DG_SM120_PREFILL_COMPILED_BMM = torch.compile(
+            _dg_sm120_prefill_torch_bmm, mode=mode, fullgraph=True
+        )
+    return _DG_SM120_PREFILL_COMPILED_BMM
+
+def _sm120_flash_mla_sparse_prefill_fwd(
     q: torch.Tensor,
     kv: torch.Tensor,
     indices: torch.Tensor,
@@ -781,12 +1276,27 @@ def patch_flashmla_sparse_prefill() -> None:
             for start in range(0, q.shape[0], chunk_size):
                 end = min(start + chunk_size, q.shape[0])
                 chunk_topk = None
+                chunk_width = indices.shape[-1]
                 if topk_length is not None:
                     chunk_topk = topk_length[start:end]
+                    trim_min_width = int(
+                        os.environ.get("DG_SM120_PREFILL_TRIM_TOPK_MIN_WIDTH", "2048")
+                    )
+                    if (
+                        os.environ.get("DG_SM120_PREFILL_TRIM_TOPK", "1") == "1"
+                        and indices.shape[-1] >= trim_min_width
+                    ):
+                        chunk_width = max(
+                            1,
+                            min(
+                                indices.shape[-1],
+                                int(chunk_topk.max().item()),
+                            ),
+                        )
                 _chunk_out, _chunk_max, chunk_lse = indexed_prefill_split(
                     q[start:end],
                     kv,
-                    indices[start:end],
+                    indices[start:end, :, :chunk_width],
                     chunk_topk,
                     attn_sink,
                     d_v,
@@ -802,11 +1312,32 @@ def patch_flashmla_sparse_prefill() -> None:
             lse = torch.empty((q.shape[0], q.shape[1]), device=q.device,
                               dtype=torch.float32)
             max_logits = torch.empty_like(lse)
+            cudnn_attention_enabled = (
+                os.environ.get("DG_SM120_PREFILL_CUDNN", "0") == "1"
+                and os.environ.get("DG_SM120_PREFILL_CUDNN_UNMASKED", "0") == "1"
+                and d_v == q.shape[-1]
+                and hasattr(torch.ops.aten, "_scaled_dot_product_cudnn_attention")
+            )
+            torch_bmm_enabled = (
+                os.environ.get("DG_SM120_PREFILL_TORCH_BMM", "1") == "1"
+                and d_v == q.shape[-1]
+            )
+            trust_indices = (
+                os.environ.get("DG_SM120_PREFILL_TRUST_INDICES", "1") == "1"
+            )
             gather_enabled = (
                 os.environ.get("DG_SM120_PREFILL_GATHER_WORKSPACE", "0") == "1"
                 and workspace_gather is not None
                 and indices.is_contiguous()
                 and kv_2d.is_contiguous()
+            )
+            index_select_enabled = (
+                os.environ.get("DG_SM120_PREFILL_INDEX_SELECT", "0") == "1"
+                and indices.is_contiguous()
+                and kv_2d.is_contiguous()
+            )
+            safe_tail_indices = (
+                os.environ.get("DG_SM120_PREFILL_EMPTY_COMBINED_INDICES", "0") == "1"
             )
             workspace_cache = getattr(
                 _sm120_flash_mla_sparse_prefill_fwd,
@@ -815,24 +1346,42 @@ def patch_flashmla_sparse_prefill() -> None:
             )
             for start in range(0, q.shape[0], chunk_size):
                 end = min(start + chunk_size, q.shape[0])
+                chunk_topk = None
+                chunk_width = indices.shape[-1]
+                if topk_length is not None:
+                    chunk_topk = topk_length[start:end]
+                    trim_min_width = int(
+                        os.environ.get("DG_SM120_PREFILL_TRIM_TOPK_MIN_WIDTH", "2048")
+                    )
+                    if (
+                        os.environ.get("DG_SM120_PREFILL_TRIM_TOPK", "1") == "1"
+                        and indices.shape[-1] >= trim_min_width
+                    ):
+                        chunk_width = max(
+                            1,
+                            min(
+                                indices.shape[-1],
+                                int(chunk_topk.max().item()),
+                            ),
+                        )
+                chunk_indices = indices[start:end, 0, :chunk_width]
                 if gather_enabled:
                     rows = end - start
-                    topk = indices.shape[-1]
                     key = (
                         q.device.index,
                         str(kv_2d.dtype),
                         chunk_size,
-                        topk,
+                        chunk_width,
                         kv_2d.shape[-1],
                     )
                     workspace = workspace_cache.get(key)
                     if workspace is None or workspace.shape != (
                         chunk_size,
-                        topk,
+                        chunk_width,
                         kv_2d.shape[-1],
                     ):
                         workspace = torch.empty(
-                            (chunk_size, topk, kv_2d.shape[-1]),
+                            (chunk_size, chunk_width, kv_2d.shape[-1]),
                             device=q.device,
                             dtype=kv_2d.dtype,
                         )
@@ -843,14 +1392,227 @@ def patch_flashmla_sparse_prefill() -> None:
                             workspace_cache,
                         )
                     workspace = workspace[:rows]
-                    workspace_gather(kv_2d, indices[start:end, 0, :], workspace)
+                    workspace_gather(kv_2d, chunk_indices, workspace)
+                elif index_select_enabled:
+                    rows = end - start
+                    key = (
+                        q.device.index,
+                        str(kv_2d.dtype),
+                        chunk_size,
+                        chunk_width,
+                        kv_2d.shape[-1],
+                    )
+                    workspace = workspace_cache.get(key)
+                    if workspace is None or workspace.shape != (
+                        chunk_size,
+                        chunk_width,
+                        kv_2d.shape[-1],
+                    ):
+                        workspace = torch.empty(
+                            (chunk_size, chunk_width, kv_2d.shape[-1]),
+                            device=q.device,
+                            dtype=kv_2d.dtype,
+                        )
+                        workspace_cache[key] = workspace
+                        setattr(
+                            _sm120_flash_mla_sparse_prefill_fwd,
+                            "_dg_sm120_workspace_cache",
+                            workspace_cache,
+                        )
+                    workspace = workspace[:rows]
+                    select_indices = chunk_indices.reshape(-1).clamp(
+                        0, kv_2d.shape[0] - 1
+                    )
+                    torch.index_select(
+                        kv_2d,
+                        0,
+                        select_indices,
+                        out=workspace.reshape(-1, kv_2d.shape[-1]),
+                    )
                 else:
-                    idx = indices[start:end, 0, :].to(torch.long)
-                    idx = idx.clamp(0, kv_2d.shape[0] - 1)
+                    idx = chunk_indices
+                    if safe_tail_indices and chunk_topk is not None:
+                        pos_cache = getattr(
+                            _sm120_flash_mla_sparse_prefill_fwd,
+                            "_dg_sm120_pos_cache",
+                            {},
+                        )
+                        pos_key = (
+                            q.device.index,
+                            idx.shape[1],
+                        )
+                        pos = pos_cache.get(pos_key)
+                        if pos is None:
+                            pos = torch.arange(idx.shape[1], device=q.device)
+                            pos_cache[pos_key] = pos
+                            setattr(
+                                _sm120_flash_mla_sparse_prefill_fwd,
+                                "_dg_sm120_pos_cache",
+                                pos_cache,
+                            )
+                        idx = torch.where(
+                            pos.reshape(1, -1)
+                            < chunk_topk.to(torch.long).reshape(-1, 1),
+                            idx,
+                            torch.zeros((), device=idx.device, dtype=idx.dtype),
+                        )
+                    elif (not trust_indices) or safe_tail_indices:
+                        idx = idx.to(torch.long).clamp(0, kv_2d.shape[0] - 1)
                     workspace = kv_2d[idx]
-                chunk_topk = None
-                if topk_length is not None:
-                    chunk_topk = topk_length[start:end]
+                if torch_bmm_enabled:
+                    active_heads = min(
+                        q.shape[1],
+                        int(os.environ.get("DG_SM120_ACTIVE_HEADS", q.shape[1])),
+                    )
+                    q_chunk = q[start:end, :active_heads, :]
+                    idx_chunk = chunk_indices[:, : workspace.shape[1]]
+                    valid = (idx_chunk >= 0) & (idx_chunk < kv_2d.shape[0])
+                    if chunk_topk is not None:
+                        pos_cache = getattr(
+                            _sm120_flash_mla_sparse_prefill_fwd,
+                            "_dg_sm120_pos_cache",
+                            {},
+                        )
+                        pos_key = (
+                            q.device.index,
+                            workspace.shape[1],
+                        )
+                        pos = pos_cache.get(pos_key)
+                        if pos is None:
+                            pos = torch.arange(workspace.shape[1], device=q.device)
+                            pos_cache[pos_key] = pos
+                            setattr(
+                                _sm120_flash_mla_sparse_prefill_fwd,
+                                "_dg_sm120_pos_cache",
+                                pos_cache,
+                            )
+                        valid = valid & (
+                            pos.reshape(1, -1)
+                            < chunk_topk.to(torch.long).reshape(-1, 1)
+                        )
+                    valid_any = valid.any(dim=-1)
+                    if cudnn_attention_enabled:
+                        bias_cache = getattr(
+                            _sm120_flash_mla_sparse_prefill_fwd,
+                            "_dg_sm120_cudnn_bias_cache",
+                            {},
+                        )
+                        bias_key = (
+                            q.device.index,
+                            chunk_size,
+                            workspace.shape[1],
+                        )
+                        bias = bias_cache.get(bias_key)
+                        if bias is None or bias.shape != (
+                            chunk_size,
+                            1,
+                            1,
+                            workspace.shape[1],
+                        ):
+                            bias = torch.empty(
+                                (chunk_size, 1, 1, workspace.shape[1]),
+                                device=q.device,
+                                dtype=torch.float32,
+                            )
+                            bias_cache[bias_key] = bias
+                            setattr(
+                                _sm120_flash_mla_sparse_prefill_fwd,
+                                "_dg_sm120_cudnn_bias_cache",
+                                bias_cache,
+                            )
+                        bias = bias[: end - start]
+                        safe_valid = valid | ~valid_any.reshape(end - start, 1)
+                        bias.zero_()
+                        bias.masked_fill_(
+                            ~safe_valid.reshape(end - start, 1, 1, workspace.shape[1]),
+                            float("-inf"),
+                        )
+                        chunk_out4, chunk_lse4, *_ = (
+                            torch.ops.aten._scaled_dot_product_cudnn_attention(
+                                q_chunk.unsqueeze(2),
+                                workspace.unsqueeze(1),
+                                workspace.unsqueeze(1),
+                                bias,
+                                True,
+                                0.0,
+                                False,
+                                False,
+                                scale=float(sm_scale),
+                            )
+                        )
+                        chunk_out = chunk_out4.squeeze(2)
+                        chunk_lse = chunk_lse4.squeeze(-1).squeeze(-1)
+                        chunk_lse = chunk_lse.masked_fill(
+                            ~valid_any.unsqueeze(1), float("-inf")
+                        )
+                        chunk_out = chunk_out.masked_fill(
+                            ~valid_any.reshape(end - start, 1, 1), 0
+                        )
+                        if attn_sink is not None:
+                            gate = torch.sigmoid(
+                                chunk_lse
+                                - attn_sink[:active_heads]
+                                .to(chunk_lse.dtype)
+                                .reshape(1, -1)
+                            )
+                            chunk_out = (
+                                chunk_out * gate.to(chunk_out.dtype).unsqueeze(-1)
+                            )
+                    else:
+                        use_compiled_bmm = (
+                            os.environ.get("DG_SM120_PREFILL_TORCH_COMPILE", "0") == "1"
+                            and attn_sink is not None
+                            and (end - start) >= int(
+                                os.environ.get(
+                                    "DG_SM120_PREFILL_TORCH_COMPILE_MIN_ROWS", "64"
+                                )
+                            )
+                        )
+                        if use_compiled_bmm:
+                            chunk_out, chunk_lse = _dg_sm120_get_prefill_compiled_bmm()(
+                                q_chunk,
+                                workspace,
+                                valid,
+                                valid_any,
+                                attn_sink[:active_heads],
+                                float(sm_scale),
+                            )
+                        else:
+                            scores = torch.bmm(
+                                q_chunk, workspace.transpose(1, 2)
+                            ).to(torch.float32)
+                            scores.mul_(float(sm_scale))
+                            scores.masked_fill_(~valid.unsqueeze(1), float("-inf"))
+                            scores = torch.where(
+                                valid_any.reshape(-1, 1, 1),
+                                scores,
+                                torch.zeros_like(scores),
+                            )
+                            chunk_lse = torch.logsumexp(scores, dim=-1)
+                            probs = torch.softmax(scores, dim=-1).to(q.dtype)
+                            probs.masked_fill_(~valid_any.reshape(-1, 1, 1), 0)
+                            chunk_out = torch.bmm(probs, workspace)
+                            if attn_sink is not None:
+                                gate = torch.sigmoid(
+                                    chunk_lse
+                                    - attn_sink[:active_heads]
+                                    .to(chunk_lse.dtype)
+                                    .reshape(1, -1)
+                                )
+                                chunk_out = (
+                                    chunk_out * gate.to(chunk_out.dtype).unsqueeze(-1)
+                                )
+                    out[start:end, :active_heads, :].copy_(chunk_out)
+                    if active_heads < q.shape[1]:
+                        out[start:end, active_heads:, :].zero_()
+                    lse[start:end, :active_heads].copy_(
+                        chunk_lse.masked_fill(
+                            ~valid_any.unsqueeze(1), float("-inf")
+                        )
+                    )
+                    if active_heads < q.shape[1]:
+                        lse[start:end, active_heads:].fill_(float("-inf"))
+                    continue
                 chunk_out, chunk_lse = workspace_decode(
                     q[start:end].unsqueeze(1),
                     workspace,
@@ -930,21 +1692,23 @@ def patch_flashmla_sparse_prefill() -> None:
     if path is None or source is None:
         raise RuntimeError("Could not find flash_mla_sparse_fwd marker")
 
-    if (
-        "def _sm120_flash_mla_sparse_prefill_fwd" in source
-        and (
-            "DG_SM120_PREFILL_WORKSPACE_CHUNK" not in source
-            or "sm120_sparse_mla_prefill_from_bf16_workspace_split" not in source
-        )
-    ):
+    if "_DG_SM120_PREFILL_COMPILED_BMM = None" in source:
         source = re.sub(
-            r"def _sm120_flash_mla_sparse_prefill_fwd\(.*?\n\ndef flash_mla_sparse_fwd\(",
-            helper + "def flash_mla_sparse_fwd(",
+            r"_DG_SM120_PREFILL_COMPILED_BMM = None\n\n.*?\n\n(?=def flash_mla_sparse_fwd\()",
+            helper,
             source,
             count=1,
             flags=re.S,
         )
-    elif helper not in source:
+    elif "def _sm120_flash_mla_sparse_prefill_fwd" in source:
+        source = re.sub(
+            r"def _sm120_flash_mla_sparse_prefill_fwd\(.*?\n\n(?=def flash_mla_sparse_fwd\()",
+            helper,
+            source,
+            count=1,
+            flags=re.S,
+        )
+    else:
         source = source.replace(marker, helper + marker, 1)
 
     old = """    results = flash_mla_cuda.sparse_prefill_fwd(
@@ -961,9 +1725,11 @@ def patch_flashmla_sparse_prefill() -> None:
     )
     return results
 """
-    if old not in source:
+    if old in source:
+        source = source.replace(old, new, 1)
+    elif "return _sm120_flash_mla_sparse_prefill_fwd(" not in source:
         raise RuntimeError(f"Could not patch flash_mla_sparse_fwd body in {path}")
-    path.write_text(source.replace(old, new, 1))
+    path.write_text(source)
 
 
 def patch_flashmla_sparse_prefill_workspace_factor() -> None:
@@ -2082,6 +2848,7 @@ def patch_sm120_sparse_indexer_full_context_decode() -> None:
         source = source.replace(
             "attn_metadata_narrowed.max_seq_len", "attn_metadata.max_seq_len"
         )
+        source = source.replace("                topk_indices_buffer[:num_padded_tokens] = -1\n", "")
         path.write_text(source)
         return
 
@@ -2100,7 +2867,6 @@ def patch_sm120_sparse_indexer_full_context_decode() -> None:
                 None,
             )
             if fill_all_indices is not None:
-                topk_indices_buffer[:num_padded_tokens] = -1
                 topk_indices = topk_indices_buffer[
                     :num_padded_tokens, :topk_tokens
                 ]
@@ -2121,6 +2887,444 @@ def patch_sm120_sparse_indexer_full_context_decode() -> None:
     if anchor not in source:
         raise RuntimeError(f"Could not patch SM120 full-context sparse decode in {path}")
     source = source.replace(anchor, anchor + insert, 1)
+    path.write_text(source)
+
+
+
+def patch_deepseek_v4_compressor_graph_native_metadata() -> None:
+    """Build compressor metadata on device for SM120.
+
+    Upstream builds token_to_req_indices with CPU repeat_interleave + pinned
+    H2D copy and separately launches a block-table clamp. The SM120 path fuses
+    token-to-request fill and block-table nonnegative clamp into one graph-safe
+    device launch, matching SGLang-style graph-native metadata prep.
+    """
+    path = Path(
+        "/usr/local/lib/python3.12/dist-packages/vllm/model_executor/"
+        "layers/deepseek_compressor.py"
+    )
+    source = path.read_text()
+
+    new_build = """    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+    ) -> CompressorMetadata:
+        num_reqs = common_attn_metadata.num_reqs
+        num_tokens = common_attn_metadata.num_actual_tokens
+        token_to_req_indices = self.token_to_req_indices[:num_tokens]
+        block_table = common_attn_metadata.block_table_tensor
+        build_metadata = None
+        if token_to_req_indices.is_cuda and common_attn_metadata.query_start_loc.is_cuda:
+            try:
+                import deep_gemm
+
+                build_metadata = getattr(
+                    getattr(deep_gemm, "_C", None),
+                    "sm120_build_compressor_metadata",
+                    None,
+                )
+            except Exception:
+                build_metadata = None
+        if (
+            build_metadata is not None
+            and torch.cuda.get_device_capability(token_to_req_indices.device)[0] >= 12
+        ):
+            build_metadata(
+                token_to_req_indices,
+                common_attn_metadata.query_start_loc,
+                block_table,
+                num_reqs,
+            )
+        else:
+            query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+            query_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+            x = torch.repeat_interleave(torch.arange(num_reqs), query_lens).pin_memory()
+            token_to_req_indices = self.token_to_req_indices[: x.shape[0]]
+            token_to_req_indices.copy_(x, non_blocking=True)
+            block_table = block_table.clamp_(min=0)
+        return CompressorMetadata(
+            block_table=block_table,
+            slot_mapping=common_attn_metadata.slot_mapping,
+            block_size=self.block_size,
+            token_to_req_indices=token_to_req_indices,
+        )
+"""
+
+    old_upstream = """    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+    ) -> CompressorMetadata:
+        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+        num_reqs = common_attn_metadata.num_reqs
+        query_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+        x = torch.repeat_interleave(torch.arange(num_reqs), query_lens).pin_memory()
+        token_to_req_indices = self.token_to_req_indices[: x.shape[0]]
+        token_to_req_indices.copy_(x, non_blocking=True)
+        return CompressorMetadata(
+            block_table=common_attn_metadata.block_table_tensor.clamp_(min=0),
+            slot_mapping=common_attn_metadata.slot_mapping,
+            block_size=self.block_size,
+            token_to_req_indices=token_to_req_indices,
+        )
+"""
+
+    old_fill_only = """    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+    ) -> CompressorMetadata:
+        num_reqs = common_attn_metadata.num_reqs
+        num_tokens = common_attn_metadata.num_actual_tokens
+        token_to_req_indices = self.token_to_req_indices[:num_tokens]
+        fill_token_to_req = None
+        if token_to_req_indices.is_cuda and common_attn_metadata.query_start_loc.is_cuda:
+            try:
+                import deep_gemm
+
+                fill_token_to_req = getattr(
+                    getattr(deep_gemm, "_C", None),
+                    "sm120_fill_token_to_req_indices",
+                    None,
+                )
+            except Exception:
+                fill_token_to_req = None
+        if (
+            fill_token_to_req is not None
+            and torch.cuda.get_device_capability(token_to_req_indices.device)[0] >= 12
+        ):
+            fill_token_to_req(
+                token_to_req_indices, common_attn_metadata.query_start_loc, num_reqs
+            )
+        else:
+            query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+            query_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+            x = torch.repeat_interleave(torch.arange(num_reqs), query_lens).pin_memory()
+            token_to_req_indices = self.token_to_req_indices[: x.shape[0]]
+            token_to_req_indices.copy_(x, non_blocking=True)
+        return CompressorMetadata(
+            block_table=common_attn_metadata.block_table_tensor.clamp_(min=0),
+            slot_mapping=common_attn_metadata.slot_mapping,
+            block_size=self.block_size,
+            token_to_req_indices=token_to_req_indices,
+        )
+"""
+
+    if "sm120_build_compressor_metadata" in source:
+        path.write_text(source)
+        return
+    if old_fill_only in source:
+        source = source.replace(old_fill_only, new_build, 1)
+    elif old_upstream in source:
+        source = source.replace(old_upstream, new_build, 1)
+    else:
+        raise RuntimeError(f"Could not patch SM120 compressor metadata in {path}")
+    path.write_text(source)
+
+
+
+def patch_flashmla_sparse_req_id_graph_native_metadata() -> None:
+    """Build FlashMLA sparse req_id_per_token on device for SM120.
+
+    The FlashMLA sparse metadata builder still used NumPy repeat on the host,
+    then copied a freshly-built request-id vector into a persistent GPU buffer.
+    This is another per-build metadata expansion on the scheduler/Python path.
+    Reuse the SM120 token-to-request CUDA kernel so CUDA graph replay consumes a
+    stable device buffer without host repeat/copy work.
+    """
+    path = Path(
+        "/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/"
+        "backends/mla/flashmla_sparse.py"
+    )
+    source = path.read_text()
+    if "sm120_fill_token_to_req_indices" in source:
+        path.write_text(source)
+        return
+
+    old = """        starts = np.asarray(cm.query_start_loc_cpu, dtype=np.int32)
+        seg_lengths = np.diff(starts)
+        req_id_per_token = np.repeat(
+            np.arange(seg_lengths.shape[0], dtype=np.int32), seg_lengths
+        )
+        # Zero-fill for cudagraphs
+        self.req_id_per_token_buffer.fill_(0)
+        self.req_id_per_token_buffer[: req_id_per_token.shape[0]].copy_(
+            torch.from_numpy(req_id_per_token), non_blocking=True
+        )
+        req_id_per_token = self.req_id_per_token_buffer[:num_tokens]
+"""
+    new = """        req_id_per_token = self.req_id_per_token_buffer[:num_tokens]
+        fill_token_to_req = None
+        if req_id_per_token.is_cuda and cm.query_start_loc.is_cuda:
+            try:
+                import deep_gemm
+
+                fill_token_to_req = getattr(
+                    getattr(deep_gemm, "_C", None),
+                    "sm120_fill_token_to_req_indices",
+                    None,
+                )
+            except Exception:
+                fill_token_to_req = None
+        if (
+            fill_token_to_req is not None
+            and torch.cuda.get_device_capability(req_id_per_token.device)[0] >= 12
+        ):
+            fill_token_to_req(req_id_per_token, cm.query_start_loc, cm.num_reqs)
+        else:
+            starts = np.asarray(cm.query_start_loc_cpu, dtype=np.int32)
+            seg_lengths = np.diff(starts)
+            req_id_per_token_cpu = np.repeat(
+                np.arange(seg_lengths.shape[0], dtype=np.int32), seg_lengths
+            )
+            # Zero-fill for cudagraphs
+            self.req_id_per_token_buffer.fill_(0)
+            self.req_id_per_token_buffer[: req_id_per_token_cpu.shape[0]].copy_(
+                torch.from_numpy(req_id_per_token_cpu), non_blocking=True
+            )
+            req_id_per_token = self.req_id_per_token_buffer[:num_tokens]
+"""
+    if old not in source:
+        raise RuntimeError(f"Could not patch SM120 FlashMLA sparse req-id metadata in {path}")
+    source = source.replace(old, new, 1)
+    path.write_text(source)
+
+def patch_deepseek_v4_sparse_swa_graph_native_metadata() -> None:
+    """Build sparse-SWA token metadata on device for SM120.
+
+    Sparse SWA used the same CPU repeat_interleave + pinned H2D token-to-request
+    construction as the compressor metadata path, plus separate CUDA launches
+    for slot validity and decode-lens tail clearing. Fuse those graph-replay
+    metadata chores into one SM120 extension call so decode/spec replay avoids
+    host-side metadata expansion.
+    """
+    path = Path(
+        "/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/"
+        "backends/mla/sparse_swa.py"
+    )
+    source = path.read_text()
+
+    # Keep a CPU view of prefill seq_lens so SM120 prefill workspace sizing can
+    # avoid a per-layer GPU max().item() sync while still using the exact
+    # context+query lengths that the metadata builder already materialized.
+    source = source.replace(
+        "    prefill_seq_lens: torch.Tensor | None = None\n"
+        "    prefill_gather_lens: torch.Tensor | None = None\n",
+        "    prefill_seq_lens: torch.Tensor | None = None\n"
+        "    prefill_seq_lens_cpu: torch.Tensor | None = None\n"
+        "    prefill_gather_lens: torch.Tensor | None = None\n",
+        1,
+    )
+    source = source.replace(
+        "            query_start_loc,\n"
+        "        )\n\n"
+        "        # Per-layer-type tile-scheduler plan holders.",
+        "            query_start_loc,\n"
+        "            common_attn_metadata.seq_lens_cpu,\n"
+        "        )\n\n"
+        "        # Per-layer-type tile-scheduler plan holders.",
+        1,
+    )
+    source = source.replace(
+        "        query_start_loc: torch.Tensor,\n"
+        "    ) -> dict[str, torch.Tensor | None]:\n",
+        "        query_start_loc: torch.Tensor,\n"
+        "        seq_lens_cpu: torch.Tensor,\n"
+        "    ) -> dict[str, torch.Tensor | None]:\n",
+        1,
+    )
+    source = source.replace(
+        "            result[\"prefill_seq_lens\"] = seq_lens[num_decodes:]\n"
+        "            result[\"prefill_gather_lens\"] = pfx_gather_lens\n",
+        "            result[\"prefill_seq_lens\"] = seq_lens[num_decodes:]\n"
+        "            result[\"prefill_seq_lens_cpu\"] = seq_lens_cpu[num_decodes:]\n"
+        "            result[\"prefill_gather_lens\"] = pfx_gather_lens\n",
+        1,
+    )
+    decode_metadata_already_patched = "sm120_build_sparse_swa_decode_metadata" in source
+
+    if not decode_metadata_already_patched:
+        old = """        # NOTE: Ensure all metadata tensors maintain fixed memory addresses
+        # for CUDA graph compatibility.
+        query_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+        x = torch.repeat_interleave(torch.arange(num_reqs), query_lens).pin_memory()
+        token_to_req_indices = self.token_to_req_indices[: x.shape[0]]
+        token_to_req_indices.copy_(x, non_blocking=True)
+
+        is_valid_token = self.is_valid_token[: slot_mapping.shape[0]]
+        is_valid_token.copy_(slot_mapping >= 0)
+
+        if num_decode_tokens > 0:
+            self.decode_swa_lens[num_decode_tokens:] = 0
+            _compute_swa_indices_and_lens_kernel[(num_decode_tokens,)](
+"""
+        new = """        # NOTE: Ensure all metadata tensors maintain fixed memory addresses
+        # for CUDA graph compatibility. On SM120, keep this on-device so replay
+        # avoids CPU repeat_interleave, pinned copies, and small fill kernels.
+        token_to_req_indices = self.token_to_req_indices[: slot_mapping.shape[0]]
+        is_valid_token = self.is_valid_token[: slot_mapping.shape[0]]
+        sm120_sparse_swa_decode_metadata_built = False
+        build_sparse_swa_decode_metadata = None
+        build_sparse_swa_metadata = None
+        if token_to_req_indices.is_cuda and query_start_loc.is_cuda:
+            try:
+                import deep_gemm
+
+                _dg_c = getattr(deep_gemm, "_C", None)
+                build_sparse_swa_decode_metadata = getattr(
+                    _dg_c,
+                    "sm120_build_sparse_swa_decode_metadata",
+                    None,
+                )
+                build_sparse_swa_metadata = getattr(
+                    _dg_c,
+                    "sm120_build_sparse_swa_metadata",
+                    None,
+                )
+            except Exception:
+                build_sparse_swa_decode_metadata = None
+                build_sparse_swa_metadata = None
+        if (
+            build_sparse_swa_decode_metadata is not None
+            and torch.cuda.get_device_capability(token_to_req_indices.device)[0] >= 12
+        ):
+            build_sparse_swa_decode_metadata(
+                token_to_req_indices,
+                is_valid_token,
+                query_start_loc,
+                slot_mapping,
+                self.decode_swa_lens,
+                self.decode_swa_indices,
+                seq_lens,
+                block_table,
+                num_reqs,
+                num_decode_tokens,
+                self.window_size,
+                self.block_size,
+            )
+            sm120_sparse_swa_decode_metadata_built = True
+        elif (
+            build_sparse_swa_metadata is not None
+            and torch.cuda.get_device_capability(token_to_req_indices.device)[0] >= 12
+        ):
+            build_sparse_swa_metadata(
+                token_to_req_indices,
+                is_valid_token,
+                query_start_loc,
+                slot_mapping,
+                self.decode_swa_lens,
+                num_reqs,
+                num_decode_tokens,
+            )
+        else:
+            query_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+            x = torch.repeat_interleave(torch.arange(num_reqs), query_lens).pin_memory()
+            token_to_req_indices = self.token_to_req_indices[: x.shape[0]]
+            token_to_req_indices.copy_(x, non_blocking=True)
+            is_valid_token.copy_(slot_mapping >= 0)
+            if num_decode_tokens > 0:
+                self.decode_swa_lens[num_decode_tokens:] = 0
+
+        if num_decode_tokens > 0 and not sm120_sparse_swa_decode_metadata_built:
+            _compute_swa_indices_and_lens_kernel[(num_decode_tokens,)](
+"""
+        if old in source:
+            source = source.replace(old, new, 1)
+        else:
+            old_patched = """        build_sparse_swa_metadata = None
+        if token_to_req_indices.is_cuda and query_start_loc.is_cuda:
+            try:
+                import deep_gemm
+
+                build_sparse_swa_metadata = getattr(
+                    getattr(deep_gemm, "_C", None),
+                    "sm120_build_sparse_swa_metadata",
+                    None,
+                )
+            except Exception:
+                build_sparse_swa_metadata = None
+        if (
+            build_sparse_swa_metadata is not None
+            and torch.cuda.get_device_capability(token_to_req_indices.device)[0] >= 12
+        ):
+            build_sparse_swa_metadata(
+                token_to_req_indices,
+                is_valid_token,
+                query_start_loc,
+                slot_mapping,
+                self.decode_swa_lens,
+                num_reqs,
+                num_decode_tokens,
+            )
+        else:
+            query_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+            x = torch.repeat_interleave(torch.arange(num_reqs), query_lens).pin_memory()
+            token_to_req_indices = self.token_to_req_indices[: x.shape[0]]
+            token_to_req_indices.copy_(x, non_blocking=True)
+            is_valid_token.copy_(slot_mapping >= 0)
+            if num_decode_tokens > 0:
+                self.decode_swa_lens[num_decode_tokens:] = 0
+
+        if num_decode_tokens > 0:
+            _compute_swa_indices_and_lens_kernel[(num_decode_tokens,)](
+"""
+            if old_patched not in source:
+                raise RuntimeError(f"Could not patch SM120 sparse SWA metadata in {path}")
+            source = source.replace(old_patched, new, 1)
+
+    if "sm120_build_sparse_swa_prefill_metadata" not in source:
+        old = """            _compute_prefill_metadata_kernel[(1,)](
+                pfx_gather_lens,
+                seq_lens,
+                query_start_loc,
+                num_prefills,
+                num_decodes,
+                self.window_size,
+                BLOCK_SIZE=triton.next_power_of_2(num_prefills),
+            )
+"""
+        new = """            build_sparse_swa_prefill_metadata = None
+            if pfx_gather_lens.is_cuda and query_start_loc.is_cuda:
+                try:
+                    import deep_gemm
+
+                    build_sparse_swa_prefill_metadata = getattr(
+                        getattr(deep_gemm, "_C", None),
+                        "sm120_build_sparse_swa_prefill_metadata",
+                        None,
+                    )
+                except Exception:
+                    build_sparse_swa_prefill_metadata = None
+            if (
+                build_sparse_swa_prefill_metadata is not None
+                and torch.cuda.get_device_capability(pfx_gather_lens.device)[0] >= 12
+            ):
+                build_sparse_swa_prefill_metadata(
+                    pfx_gather_lens,
+                    seq_lens,
+                    query_start_loc,
+                    num_prefills,
+                    num_decodes,
+                    self.window_size,
+                )
+            else:
+                _compute_prefill_metadata_kernel[(1,)](
+                    pfx_gather_lens,
+                    seq_lens,
+                    query_start_loc,
+                    num_prefills,
+                    num_decodes,
+                    self.window_size,
+                    BLOCK_SIZE=triton.next_power_of_2(num_prefills),
+                )
+"""
+        if old not in source:
+            raise RuntimeError(f"Could not patch SM120 sparse SWA prefill metadata in {path}")
+        source = source.replace(old, new, 1)
     path.write_text(source)
 
 
@@ -2591,19 +3795,12 @@ _DG_SM120_PROFILE_PATH = _DG_SM120_PROFILE_OS.environ.get(
 def patch_mhc_reusable_buffers() -> None:
     path = Path("/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/mhc.py")
     source = path.read_text()
-    if "DG_SM120_MHC_REUSE_BUFFERS" in source:
-        source = source.replace(
-            'os.environ.get("DG_SM120_MHC_REUSE_BUFFERS", "1")',
-            'os.environ.get("DG_SM120_MHC_REUSE_BUFFERS", "0")',
-        )
-        path.write_text(source)
-        return
 
     if "import os\n" not in source:
         source = source.replace("import math\n", "import math\nimport os\n", 1)
 
-    marker = "\n\ndef mhc_pre(\n"
-    helper = r'''
+    pre_marker = "\n\ndef mhc_pre(\n"
+    pre_helper = r'''
 
 _DG_SM120_MHC_PRE_BUFFERS: dict[tuple, tuple[torch.Tensor, ...]] = {}
 
@@ -2644,11 +3841,12 @@ def _dg_sm120_mhc_pre_buffers(
     _DG_SM120_MHC_PRE_BUFFERS[key] = cached
     return cached
 '''
-    if marker not in source:
-        raise RuntimeError(f"Could not find mhc_pre marker in {path}")
-    source = source.replace(marker, helper + marker, 1)
+    if "_DG_SM120_MHC_PRE_BUFFERS" not in source:
+        if pre_marker not in source:
+            raise RuntimeError(f"Could not find mhc_pre marker in {path}")
+        source = source.replace(pre_marker, pre_helper + pre_marker, 1)
 
-    old = '''    post_mix = torch.empty(
+    old_pre_alloc = '''    post_mix = torch.empty(
         num_tokens,
         hc_mult,
         dtype=torch.float32,
@@ -2681,7 +3879,7 @@ def _dg_sm120_mhc_pre_buffers(
         device=residual.device,
     )
 '''
-    new = '''    if os.environ.get("DG_SM120_MHC_REUSE_BUFFERS", "0") != "0":
+    new_pre_alloc = '''    if os.environ.get("DG_SM120_MHC_REUSE_BUFFERS", "0") != "0":
         post_mix, comb_mix, layer_input, gemm_out_mul, gemm_out_sqrsum = (
             _dg_sm120_mhc_pre_buffers(
                 num_tokens,
@@ -2727,9 +3925,70 @@ def _dg_sm120_mhc_pre_buffers(
             device=residual.device,
         )
 '''
-    if old not in source:
-        raise RuntimeError(f"Could not patch MHC pre allocations in {path}")
-    path.write_text(source.replace(old, new, 1))
+    if old_pre_alloc in source:
+        source = source.replace(old_pre_alloc, new_pre_alloc, 1)
+
+    post_marker = "\n\ndef mhc_post(\n"
+    post_helper = r'''
+
+_DG_SM120_MHC_POST_BUFFERS: dict[tuple, list[torch.Tensor]] = {}
+
+
+def _dg_sm120_mhc_post_buffer(residual: torch.Tensor) -> torch.Tensor:
+    key = (
+        residual.device.type,
+        residual.device.index,
+        tuple(residual.shape),
+        tuple(residual.stride()),
+        residual.dtype,
+    )
+    buffers = _DG_SM120_MHC_POST_BUFFERS.get(key)
+    if buffers is None:
+        buffers = []
+        _DG_SM120_MHC_POST_BUFFERS[key] = buffers
+
+    # Avoid returning the same allocation as the input residual. In decode the
+    # previous layer output can become the next layer residual; aliasing would
+    # turn mhc_post into an accidental in-place read/write kernel.
+    residual_ptr = residual.data_ptr()
+    for buf in buffers:
+        if buf.data_ptr() != residual_ptr:
+            return buf
+
+    buf = torch.empty_strided(
+        tuple(residual.shape),
+        tuple(residual.stride()),
+        dtype=residual.dtype,
+        device=residual.device,
+    )
+    buffers.append(buf)
+    # Two buffers are enough for the sequential decode path: one may alias the
+    # current residual, and the other is safe as the next output destination.
+    if len(buffers) > 2:
+        del buffers[:-2]
+    return buf
+'''
+    if "_DG_SM120_MHC_POST_BUFFERS" not in source:
+        if post_marker not in source:
+            raise RuntimeError(f"Could not find mhc_post marker in {path}")
+        source = source.replace(post_marker, post_helper + post_marker, 1)
+
+    old_post_alloc = "    out = torch.empty_like(residual)\n"
+    new_post_alloc = '''    if os.environ.get("DG_SM120_MHC_REUSE_BUFFERS", "0") != "0":
+        out = _dg_sm120_mhc_post_buffer(residual)
+    else:
+        out = torch.empty_like(residual)
+'''
+    if "_dg_sm120_mhc_post_buffer(residual)" not in source:
+        if old_post_alloc not in source:
+            raise RuntimeError(f"Could not patch MHC post allocation in {path}")
+        source = source.replace(old_post_alloc, new_post_alloc, 1)
+
+    source = source.replace(
+        'os.environ.get("DG_SM120_MHC_REUSE_BUFFERS", "1")',
+        'os.environ.get("DG_SM120_MHC_REUSE_BUFFERS", "0")',
+    )
+    path.write_text(source)
 
 
 def patch_tp_allreduce_diagnostic_bypass() -> None:
@@ -3350,6 +4609,100 @@ def patch_deep_gemm_moe_fused_activation_quant() -> None:
     path.write_text(source)
 
 
+def patch_deep_gemm_moe_unpermute_reduce() -> None:
+    path = Path(
+        "/usr/local/lib/python3.12/dist-packages/vllm/model_executor/"
+        "layers/fused_moe/deep_gemm_utils.py"
+    )
+    source = path.read_text()
+    if "import deep_gemm\n" not in source:
+        source = source.replace("import torch\n", "import torch\nimport deep_gemm\n", 1)
+
+    marker = "sm120_moe_unpermute_reduce_bf16"
+    if marker in source:
+        source = source.replace("output.shape[1] >= 6144", "output.shape[1] >= 512")
+        path.write_text(source)
+        return
+
+    old = """def deepgemm_unpermute_and_reduce(
+    a: torch.Tensor,  # Grouped gemm output
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    inv_perm: torch.Tensor,
+    expert_map: torch.Tensor | None,
+    output: torch.Tensor,
+):
+    return ep_gather(
+        input_tensor=a,
+        recv_topk_ids=topk_ids,
+        recv_topk_weight=topk_weights,
+        input_index=inv_perm,
+        expert_map=expert_map,
+        output_tensor=output,
+    )
+"""
+    new = """def deepgemm_unpermute_and_reduce(
+    a: torch.Tensor,  # Grouped gemm output
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    inv_perm: torch.Tensor,
+    expert_map: torch.Tensor | None,
+    output: torch.Tensor,
+):
+    if (
+        a.is_cuda
+        and output.is_cuda
+        and a.dtype == torch.bfloat16
+        and output.dtype == torch.bfloat16
+        and inv_perm.dtype == torch.int32
+        and (expert_map is None or expert_map.dtype == torch.int32)
+        and topk_ids.ndim == 2
+        and topk_weights.ndim == 2
+        and inv_perm.ndim == 2
+        and topk_ids.shape == topk_weights.shape == inv_perm.shape
+        and topk_ids.shape[0] == output.shape[0]
+        and topk_ids.shape[1] <= 32
+        and output.shape[1] == a.shape[1]
+        and output.shape[1] >= 512
+        and a.stride(1) == 1
+        and output.stride(1) == 1
+        and torch.cuda.get_device_capability(output.device)[0] >= 12
+        and hasattr(deep_gemm._C, "sm120_moe_unpermute_reduce_bf16")
+    ):
+        if expert_map is None:
+            deep_gemm._C.sm120_moe_unpermute_reduce_bf16(
+                a, topk_ids, topk_weights, inv_perm, output
+            )
+        elif hasattr(deep_gemm._C, "sm120_moe_unpermute_reduce_bf16_mapped"):
+            deep_gemm._C.sm120_moe_unpermute_reduce_bf16_mapped(
+                a, topk_ids, topk_weights, inv_perm, expert_map, output
+            )
+        else:
+            return ep_gather(
+                input_tensor=a,
+                recv_topk_ids=topk_ids,
+                recv_topk_weight=topk_weights,
+                input_index=inv_perm,
+                expert_map=expert_map,
+                output_tensor=output,
+            )
+        return
+
+    return ep_gather(
+        input_tensor=a,
+        recv_topk_ids=topk_ids,
+        recv_topk_weight=topk_weights,
+        input_index=inv_perm,
+        expert_map=expert_map,
+        output_tensor=output,
+    )
+"""
+    if old not in source:
+        raise RuntimeError(f"Could not patch SM120 MoE unpermute/reduce in {path}")
+    source = source.replace(old, new, 1)
+    path.write_text(source)
+
+
 def patch_deepseek_mtp_local_argmax_reduction() -> None:
     """Allow vLLM's spec decoder to avoid full-vocab all-gather for MTP.
 
@@ -3736,10 +5089,14 @@ patch_deep_gemm_wrapper_with_starts()
 patch_deep_gemm_moe_permute_starts()
 patch_deep_gemm_moe_with_starts()
 patch_deep_gemm_moe_fused_activation_quant()
+patch_deep_gemm_moe_unpermute_reduce()
 patch_deepseek_mtp_local_argmax_reduction()
 patch_deepseek_v4_greedy_spec_argmax_fastpath()
 patch_sm120_b12x_deep_gemm_moe()
 patch_deepseek_v4_attention()
+patch_deepseek_v4_prefill_dynamic_compressed_workspace()
+patch_deepseek_v4_combine_topk_swa_empty_indices()
+patch_deepseek_v4_direct_fp8_prefill_map()
 patch_flashmla_sparse_decode()
 patch_flashmla_sparse_full_context_decode()
 patch_flashmla_sparse_prefill()
@@ -3748,6 +5105,9 @@ patch_vllm_memory_breakdown_logging()
 patch_sparse_topk_for_small_context()
 patch_sm120_sparse_indexer_graph_safe_topk()
 patch_sm120_sparse_indexer_full_context_decode()
+patch_deepseek_v4_compressor_graph_native_metadata()
+patch_deepseek_v4_sparse_swa_graph_native_metadata()
+patch_flashmla_sparse_req_id_graph_native_metadata()
 patch_deepseek_v4_sm120_compressor_overlap()
 patch_deepseek_v4_cache_gather_bounds()
 patch_mhc_reusable_buffers()

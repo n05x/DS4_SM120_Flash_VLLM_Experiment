@@ -156,6 +156,13 @@ bool env_flag_enabled(const char* name) {
            std::strcmp(value, "False") != 0;
 }
 
+bool env_flag_default_enabled(const char* name) {
+    const char* value = std::getenv(name);
+    return value == nullptr || (std::strcmp(value, "0") != 0 &&
+                                std::strcmp(value, "false") != 0 &&
+                                std::strcmp(value, "False") != 0);
+}
+
 int env_int_or_default(const char* name, int fallback) {
     const char* value = std::getenv(name);
     if (value == nullptr || *value == '\0')
@@ -200,6 +207,23 @@ __global__ void fill_scale_kernel(ElementSF* __restrict__ out, size_t total) {
     const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx < total)
         out[idx] = ElementSF(1.0f);
+}
+
+void fill_scale_async(ElementSF* out, size_t total, cudaStream_t stream) {
+    if (total == 0)
+        return;
+    if (env_flag_default_enabled("DG_SM120_USE_MEMSET_SCALE_FILL")) {
+        // UE8M0 uses exponent 127 (0x7f) for the neutral 1.0 scale.  Padding
+        // entries in CUTLASS block-scale layouts can therefore be initialized
+        // with an async memset instead of a tiny launch-bound CUDA kernel.
+        DG_CUDA_RUNTIME_CHECK(cudaMemsetAsync(out, 0x7f,
+                                              sizeof(ElementSF) * total,
+                                              stream));
+        return;
+    }
+    fill_scale_kernel<<<static_cast<unsigned>((total + 255) / 256), 256, 0,
+                        stream>>>(out, total);
+    DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
 }
 
 __global__ void convert_sfb_kernel(const float* __restrict__ sfb,
@@ -720,9 +744,7 @@ StaticScale get_or_create_sfb(const torch::Tensor& sfb, int num_groups, int n, i
         sfb.options().dtype(torch::kUInt8));
     scale.data = reinterpret_cast<ElementSF*>(scale.packed.data_ptr<uint8_t>());
     const size_t scale_total = static_cast<size_t>(num_groups) * sfb_group_elems;
-    fill_scale_kernel<<<static_cast<unsigned>((scale_total + 255) / 256), 256, 0, stream>>>(
-        scale.data, scale_total);
-    DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
+    fill_scale_async(scale.data, scale_total, stream);
     const int total = num_groups * n * k32;
     if (sfb.scalar_type() == torch::kFloat32) {
         convert_sfb_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
@@ -800,7 +822,7 @@ bool sm120_m_grouped_fp8_fp4_gemm_nt_contiguous_cutlass_impl(
     const size_t sfb_group_elems = static_cast<size_t>(size(filter_zeros(max_layout_sfb)));
     const auto stream = at::cuda::getCurrentCUDAStream();
     const int row_grouped_max_m =
-        env_int_or_default("DG_SM120_MOE_ROW_GROUPED_MAX_M", 16);
+        env_int_or_default("DG_SM120_MOE_ROW_GROUPED_MAX_M", 6);
     const bool row_grouped =
         compact_active_groups && env_flag_enabled("DG_SM120_MOE_ROW_GROUPED") &&
         (row_grouped_max_m < 0 || m <= row_grouped_max_m);
@@ -875,9 +897,7 @@ bool sm120_m_grouped_fp8_fp4_gemm_nt_contiguous_cutlass_impl(
         const bool skip_row_sfa_fill =
             sfa_kind == 1 && env_flag_enabled("DG_SM120_MOE_ROW_GROUPED_SKIP_SFA_FILL");
         if (!skip_row_sfa_fill) {
-            fill_scale_kernel<<<static_cast<unsigned>((row_sfa_total + 255) / 256), 256, 0, stream>>>(
-                scratch.sfa_ue8, row_sfa_total);
-            DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
+            fill_scale_async(scratch.sfa_ue8, row_sfa_total, stream);
         }
 
         prepare_row_grouped_kernel<<<m, 256, 0, stream>>>(
@@ -901,9 +921,7 @@ bool sm120_m_grouped_fp8_fp4_gemm_nt_contiguous_cutlass_impl(
             env_flag_enabled("DG_SM120_MOE_SKIP_SFA_FILL") &&
             (skip_fill_max_m < 0 || m <= skip_fill_max_m);
         if (!skip_sfa_fill) {
-            fill_scale_kernel<<<static_cast<unsigned>((compact_sfa_total + 255) / 256), 256, 0, stream>>>(
-                scratch.sfa_ue8, compact_sfa_total);
-            DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
+            fill_scale_async(scratch.sfa_ue8, compact_sfa_total, stream);
         }
 
         if (direct_expert_groups) {
@@ -949,9 +967,7 @@ bool sm120_m_grouped_fp8_fp4_gemm_nt_contiguous_cutlass_impl(
             DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
         }
     } else {
-        fill_scale_kernel<<<static_cast<unsigned>((sfa_total_elems + 255) / 256), 256, 0, stream>>>(
-            scratch.sfa_ue8, sfa_total_elems);
-        DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
+        fill_scale_async(scratch.sfa_ue8, sfa_total_elems, stream);
 
         prepare_grouped_kernel<<<num_groups, 256, 0, stream>>>(
             reinterpret_cast<const uint8_t*>(a.data_ptr()), sfa.data_ptr(),
@@ -1049,9 +1065,7 @@ torch::Tensor sm120_prepack_fp8_fp4_sfb(const torch::Tensor& sfb,
     auto* out = reinterpret_cast<ElementSF*>(packed.data_ptr<uint8_t>());
     const auto stream = at::cuda::getCurrentCUDAStream();
     const size_t total_elems = static_cast<size_t>(num_groups) * group_elems;
-    fill_scale_kernel<<<static_cast<unsigned>((total_elems + 255) / 256), 256, 0, stream>>>(
-        out, total_elems);
-    DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
+    fill_scale_async(out, total_elems, stream);
 
     const int total = num_groups * n * k32;
     if (sfb.scalar_type() == torch::kFloat32) {

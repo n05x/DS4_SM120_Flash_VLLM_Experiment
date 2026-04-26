@@ -10,6 +10,7 @@
 #include "apis/runtime.hpp"
 #include "jit_kernels/impls/sm120_moe_activation_quant.hpp"
 #include "jit_kernels/impls/sm120_sparse_mla_decode.hpp"
+#include "jit_kernels/impls/sm120_metadata.hpp"
 
 #ifndef TORCH_EXTENSION_NAME
 #define TORCH_EXTENSION_NAME _C
@@ -29,4 +30,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     deep_gemm::runtime::register_apis(m);
     deep_gemm::sm120_moe::register_apis(m);
     deep_gemm::sm120_mla::register_apis(m);
+    deep_gemm::sm120_metadata::register_apis(m);
 }

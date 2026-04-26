@@ -6,6 +6,7 @@
 #include <tuple>
 
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -1686,6 +1687,443 @@ __global__ void sparse_mla_prefill_workspace_kernel(
     }
 }
 
+template <typename BlockT, typename SeqT, typename StartT>
+__global__ void prefill_workspace_map_kernel(
+    int32_t* __restrict__ out, const BlockT* __restrict__ block_table,
+    const SeqT* __restrict__ seq_lens, const StartT* __restrict__ workspace_starts,
+    int num_reqs, int block_size, int64_t out_rows, int64_t block_stride_b,
+    int64_t block_stride_s, int64_t seq_stride, int64_t starts_stride) {
+    constexpr int kMapThreads = 256;
+    if (blockIdx.y == 0) {
+        const int64_t row = static_cast<int64_t>(blockIdx.x) * kMapThreads + threadIdx.x;
+        if (row < out_rows)
+            out[row] = -1;
+        return;
+    }
+
+    const int req = static_cast<int>(blockIdx.x);
+    if (req >= num_reqs)
+        return;
+
+    const int64_t start =
+        static_cast<int64_t>(workspace_starts[static_cast<int64_t>(req) * starts_stride]);
+    const int seq_len =
+        max(0, static_cast<int>(seq_lens[static_cast<int64_t>(req) * seq_stride]));
+    for (int pos = threadIdx.x; pos < seq_len; pos += blockDim.x) {
+        const int64_t row = start + pos;
+        if (row < 0 || row >= out_rows)
+            continue;
+        const int block_in_seq = pos / block_size;
+        const int block_offset = pos - block_in_seq * block_size;
+        const int64_t physical_block = static_cast<int64_t>(
+            block_table[static_cast<int64_t>(req) * block_stride_b +
+                        static_cast<int64_t>(block_in_seq) * block_stride_s]);
+        if (physical_block >= 0 && block_offset >= 0 && block_offset < block_size) {
+            const int64_t linear =
+                physical_block * static_cast<int64_t>(block_size) + block_offset;
+            out[row] = linear <= 2147483647LL
+                           ? static_cast<int32_t>(linear)
+                           : -1;
+        }
+    }
+}
+
+template <typename BlockT, typename SeqT, typename GatherT>
+__global__ void prefill_strided_workspace_map_kernel(
+    int32_t* __restrict__ out, const BlockT* __restrict__ block_table,
+    const SeqT* __restrict__ seq_lens, const GatherT* __restrict__ gather_lens,
+    int num_reqs, int block_size, int64_t out_rows, int64_t row_stride,
+    int64_t offset, bool encode_negative, int64_t block_stride_b,
+    int64_t block_stride_s, int64_t seq_stride, int64_t gather_stride) {
+    const int req = static_cast<int>(blockIdx.x);
+    if (req >= num_reqs)
+        return;
+
+    const int seq_len =
+        max(0, static_cast<int>(seq_lens[static_cast<int64_t>(req) * seq_stride]));
+    int gather_len =
+        gather_lens == nullptr
+            ? seq_len
+            : max(0, static_cast<int>(
+                         gather_lens[static_cast<int64_t>(req) * gather_stride]));
+    gather_len = min(gather_len, max(0, static_cast<int>(row_stride - offset)));
+    const int start_pos = max(0, seq_len - gather_len);
+    for (int out_idx = threadIdx.x; out_idx < gather_len; out_idx += blockDim.x) {
+        const int pos = start_pos + out_idx;
+        const int block_in_seq = pos / block_size;
+        const int block_offset = pos - block_in_seq * block_size;
+        const int64_t row =
+            static_cast<int64_t>(req) * row_stride + offset + out_idx;
+        if (row < 0 || row >= out_rows)
+            continue;
+        const int64_t physical_block = static_cast<int64_t>(
+            block_table[static_cast<int64_t>(req) * block_stride_b +
+                        static_cast<int64_t>(block_in_seq) * block_stride_s]);
+        if (physical_block >= 0 && block_offset >= 0 && block_offset < block_size) {
+            const int64_t linear =
+                physical_block * static_cast<int64_t>(block_size) + block_offset;
+            if (linear <= 2147483645LL) {
+                const int32_t encoded = encode_negative
+                                            ? -static_cast<int32_t>(linear) - 2
+                                            : static_cast<int32_t>(linear);
+                out[row] = encoded;
+            }
+        }
+    }
+}
+
+template <typename q_t, typename index_t>
+__global__ void sparse_mla_prefill_fp8_map_score_tiled_kernel(
+    const q_t* __restrict__ q, const uint8_t* __restrict__ k_cache,
+    const uint8_t* __restrict__ extra_k_cache,
+    const int32_t* __restrict__ workspace_map,
+    const index_t* __restrict__ indices, const void* __restrict__ topk_length,
+    float* __restrict__ scores, int num_tokens, int active_heads, int num_heads,
+    int workspace_rows, int topk, int block_size, int extra_block_size, int64_t q_stride_t,
+    int64_t q_stride_h, int64_t q_stride_d, int64_t cache_blocks,
+    int64_t extra_cache_blocks, int64_t cache_stride0_bytes,
+    int64_t extra_cache_stride0_bytes, int64_t indices_stride_t,
+    int64_t indices_stride_k, int topk_length_kind, float softmax_scale) {
+    const int group_id = threadIdx.x / kScoreGroupSize;
+    const int lane = threadIdx.x - group_id * kScoreGroupSize;
+    const int k_idx = blockIdx.x * kScoreCandidatesPerBlock + group_id;
+    const int head = blockIdx.y;
+    const int token = blockIdx.z;
+    if (token >= num_tokens || head >= active_heads || k_idx >= topk)
+        return;
+
+    const int limit = max(
+        0, min(topk,
+               load_length_value(topk_length, topk_length_kind, token, topk)));
+    const int64_t score_offset =
+        (static_cast<int64_t>(token) * active_heads + head) * topk + k_idx;
+    if (k_idx >= limit) {
+        if (lane == 0)
+            scores[score_offset] = -INFINITY;
+        return;
+    }
+
+    const int64_t workspace_idx = load_index<index_t>(
+        indices, static_cast<int64_t>(token) * indices_stride_t +
+                     static_cast<int64_t>(k_idx) * indices_stride_k);
+    int64_t linear = -1;
+    bool use_extra = false;
+    if (workspace_idx >= 0 && workspace_idx < workspace_rows)
+        linear = static_cast<int64_t>(workspace_map[workspace_idx]);
+    if (linear < -1) {
+        use_extra = true;
+        linear = -linear - 2;
+    }
+    const int64_t selected_cache_blocks =
+        use_extra ? extra_cache_blocks : cache_blocks;
+    const int selected_block_size = use_extra ? extra_block_size : block_size;
+    const int64_t max_linear =
+        selected_cache_blocks * static_cast<int64_t>(selected_block_size);
+    if (linear < 0 || linear >= max_linear) {
+        if (lane == 0)
+            scores[score_offset] = -INFINITY;
+        return;
+    }
+
+    float partial = 0.0f;
+    const uint8_t* selected_cache =
+        use_extra ? extra_k_cache : k_cache;
+    const int64_t selected_stride =
+        use_extra ? extra_cache_stride0_bytes : cache_stride0_bytes;
+    if (selected_cache == nullptr) {
+        if (lane == 0)
+            scores[score_offset] = -INFINITY;
+        return;
+    }
+    const uint8_t* token_ptr =
+        token_ptr_from_linear(selected_cache, selected_stride, selected_block_size, linear);
+    float scales[kNumQuantBlocks];
+    const uint8_t* scale_ptr =
+        scale_ptr_from_linear(selected_cache, selected_stride, selected_block_size, linear);
+#pragma unroll
+    for (int s = 0; s < kNumQuantBlocks; ++s)
+        scales[s] = decode_ue8m0_scale(scale_ptr[s]);
+    for (int d = lane; d < kHeadDim; d += kScoreGroupSize) {
+        const float qv = load_q_value<q_t>(
+            q, static_cast<int64_t>(token) * q_stride_t +
+                   static_cast<int64_t>(head) * q_stride_h +
+                   static_cast<int64_t>(d) * q_stride_d);
+        partial += qv * load_cache_value_from_token(token_ptr, scales, d);
+    }
+
+    for (int offset = kScoreGroupSize / 2; offset > 0; offset >>= 1)
+        partial += __shfl_down_sync(0xffffffffu, partial, offset,
+                                    kScoreGroupSize);
+    if (lane == 0)
+        scores[score_offset] = partial * softmax_scale;
+}
+
+template <typename out_t, typename index_t>
+__global__ void sparse_mla_prefill_fp8_map_output_kernel(
+    const uint8_t* __restrict__ k_cache,
+    const uint8_t* __restrict__ extra_k_cache,
+    const int32_t* __restrict__ workspace_map,
+    const index_t* __restrict__ indices, const void* __restrict__ topk_length,
+    const float* __restrict__ scores, const float* __restrict__ lse,
+    const float* __restrict__ attn_sink, out_t* __restrict__ out,
+    int num_tokens, int active_heads, int num_heads, int workspace_rows,
+    int topk, int block_size, int extra_block_size, int64_t cache_blocks, int64_t extra_cache_blocks,
+    int64_t cache_stride0_bytes, int64_t extra_cache_stride0_bytes,
+    int64_t indices_stride_t, int64_t indices_stride_k, int64_t out_stride_t,
+    int64_t out_stride_h, int64_t out_stride_d, int topk_length_kind) {
+    const int th = blockIdx.x;
+    const int tile = blockIdx.y;
+    const int token = th / active_heads;
+    const int head = th - token * active_heads;
+    const int d = tile * blockDim.x + threadIdx.x;
+    if (token >= num_tokens || d >= kHeadDim)
+        return;
+
+    const int limit = max(
+        0, min(topk,
+               load_length_value(topk_length, topk_length_kind, token, topk)));
+    const int64_t score_base =
+        (static_cast<int64_t>(token) * active_heads + head) * topk;
+    float accum = 0.0f;
+    for (int k_idx = 0; k_idx < limit; ++k_idx) {
+        const float p = scores[score_base + k_idx];
+        if (p == 0.0f)
+            continue;
+        const int64_t workspace_idx = load_index<index_t>(
+            indices, static_cast<int64_t>(token) * indices_stride_t +
+                         static_cast<int64_t>(k_idx) * indices_stride_k);
+        int64_t linear = -1;
+        bool use_extra = false;
+        if (workspace_idx >= 0 && workspace_idx < workspace_rows)
+            linear = static_cast<int64_t>(workspace_map[workspace_idx]);
+        if (linear < -1) {
+            use_extra = true;
+            linear = -linear - 2;
+        }
+        const uint8_t* selected_cache =
+            use_extra ? extra_k_cache : k_cache;
+        if (selected_cache == nullptr)
+            continue;
+        const int64_t selected_cache_blocks =
+            use_extra ? extra_cache_blocks : cache_blocks;
+        const int selected_block_size = use_extra ? extra_block_size : block_size;
+        const int64_t max_selected_linear =
+            selected_cache_blocks * static_cast<int64_t>(selected_block_size);
+        if (linear < 0 || linear >= max_selected_linear)
+            continue;
+        accum += p * load_cache_value(
+                         selected_cache,
+                         use_extra ? extra_cache_stride0_bytes
+                                   : cache_stride0_bytes,
+                         selected_block_size, linear, d);
+    }
+
+    const float row_lse =
+        lse[static_cast<int64_t>(token) * num_heads + head];
+    const float sink = attn_sink == nullptr ? 0.0f : attn_sink[head];
+    const float gate =
+        attn_sink == nullptr ? 1.0f : 1.0f / (1.0f + expf(-(row_lse - sink)));
+    store_out_value<out_t>(
+        out, static_cast<int64_t>(token) * out_stride_t +
+                 static_cast<int64_t>(head) * out_stride_h +
+                 static_cast<int64_t>(d) * out_stride_d,
+        accum * gate);
+}
+
+template <typename q_t, typename out_t, typename index_t>
+__global__ void sparse_mla_prefill_fp8_map_grouped_kernel(
+    const q_t* __restrict__ q, const uint8_t* __restrict__ k_cache,
+    const uint8_t* __restrict__ extra_k_cache,
+    const int32_t* __restrict__ workspace_map,
+    const index_t* __restrict__ indices, const void* __restrict__ topk_length,
+    const float* __restrict__ attn_sink, out_t* __restrict__ out,
+    float* __restrict__ lse, int num_tokens, int active_heads, int num_heads,
+    int workspace_rows, int topk, int block_size, int extra_block_size,
+    int64_t cache_blocks, int64_t extra_cache_blocks,
+    int64_t cache_stride0_bytes, int64_t extra_cache_stride0_bytes,
+    int64_t q_stride_t, int64_t q_stride_h, int64_t q_stride_d,
+    int64_t indices_stride_t, int64_t indices_stride_k, int64_t out_stride_t,
+    int64_t out_stride_h, int64_t out_stride_d, int topk_length_kind,
+    float softmax_scale) {
+    extern __shared__ unsigned char smem[];
+    unsigned char* cursor = smem;
+    float* q_s = reinterpret_cast<float*>(cursor);
+    cursor += static_cast<size_t>(kHeadDim) * sizeof(float);
+    float* scores = reinterpret_cast<float*>(cursor);
+    cursor += static_cast<size_t>(topk) * sizeof(float);
+    int64_t* linear_s = align_shared_ptr<int64_t>(cursor);
+    cursor += static_cast<size_t>(topk) * sizeof(int64_t);
+    int* source_s = align_shared_ptr<int>(cursor);
+    cursor += static_cast<size_t>(topk) * sizeof(int);
+    float* scale_s = align_shared_ptr<float>(cursor);
+
+    const int th = blockIdx.x;
+    const int token = th / active_heads;
+    const int head = th - token * active_heads;
+    if (token >= num_tokens)
+        return;
+
+    for (int d = threadIdx.x; d < kHeadDim; d += blockDim.x) {
+        q_s[d] = load_q_value<q_t>(
+            q, static_cast<int64_t>(token) * q_stride_t +
+                   static_cast<int64_t>(head) * q_stride_h +
+                   static_cast<int64_t>(d) * q_stride_d);
+    }
+
+    const int limit = max(
+        0, min(topk,
+               load_length_value(topk_length, topk_length_kind, token, topk)));
+    const int64_t max_primary_linear =
+        cache_blocks * static_cast<int64_t>(block_size);
+    const int64_t max_extra_linear =
+        extra_cache_blocks * static_cast<int64_t>(extra_block_size);
+
+    for (int j = threadIdx.x; j < topk; j += blockDim.x) {
+        int64_t linear = -1;
+        bool use_extra = false;
+        if (j < limit) {
+            const int64_t workspace_idx = load_index<index_t>(
+                indices, static_cast<int64_t>(token) * indices_stride_t +
+                             static_cast<int64_t>(j) * indices_stride_k);
+            if (workspace_idx >= 0 && workspace_idx < workspace_rows)
+                linear = static_cast<int64_t>(workspace_map[workspace_idx]);
+            if (linear < -1) {
+                use_extra = true;
+                linear = -linear - 2;
+            }
+            const int64_t max_linear =
+                use_extra ? max_extra_linear : max_primary_linear;
+            if (linear < 0 || linear >= max_linear)
+                linear = -1;
+        }
+
+        linear_s[j] = linear;
+        source_s[j] = use_extra ? 1 : 0;
+        float* cand_scales = scale_s + static_cast<int64_t>(j) * kNumQuantBlocks;
+#pragma unroll
+        for (int s = 0; s < kNumQuantBlocks; ++s)
+            cand_scales[s] = 0.0f;
+        if (linear >= 0) {
+            const uint8_t* selected_cache = use_extra ? extra_k_cache : k_cache;
+            const int64_t selected_stride =
+                use_extra ? extra_cache_stride0_bytes : cache_stride0_bytes;
+            const int selected_block_size =
+                use_extra ? extra_block_size : block_size;
+            if (selected_cache != nullptr) {
+                const uint8_t* scales = scale_ptr_from_linear(
+                    selected_cache, selected_stride, selected_block_size,
+                    linear);
+#pragma unroll
+                for (int s = 0; s < kNumQuantBlocks; ++s)
+                    cand_scales[s] = decode_ue8m0_scale(scales[s]);
+            } else {
+                linear_s[j] = -1;
+            }
+        }
+    }
+    __syncthreads();
+
+    const int group_id = threadIdx.x / kGroupedScoreGroupSize;
+    const int lane = threadIdx.x - group_id * kGroupedScoreGroupSize;
+    for (int base = 0; base < topk; base += kGroupedScoreGroups) {
+        const int j = base + group_id;
+        float partial = 0.0f;
+        bool valid = false;
+        if (j < topk && j < limit && linear_s[j] >= 0) {
+            valid = true;
+            const bool use_extra = source_s[j] != 0;
+            const uint8_t* selected_cache = use_extra ? extra_k_cache : k_cache;
+            const int64_t selected_stride =
+                use_extra ? extra_cache_stride0_bytes : cache_stride0_bytes;
+            const int selected_block_size =
+                use_extra ? extra_block_size : block_size;
+            const uint8_t* token_ptr = token_ptr_from_linear(
+                selected_cache, selected_stride, selected_block_size,
+                linear_s[j]);
+            const float* cand_scales =
+                scale_s + static_cast<int64_t>(j) * kNumQuantBlocks;
+            for (int d = lane; d < kHeadDim; d += kGroupedScoreGroupSize) {
+                partial += q_s[d] *
+                           load_cache_value_from_token(token_ptr, cand_scales, d);
+            }
+        }
+        for (int offset = kGroupedScoreGroupSize / 2; offset > 0; offset >>= 1)
+            partial += __shfl_down_sync(0xffffffffu, partial, offset,
+                                        kGroupedScoreGroupSize);
+        if (lane == 0 && j < topk)
+            scores[j] = valid ? partial * softmax_scale : -INFINITY;
+    }
+    __syncthreads();
+
+    __shared__ float reduce_buf[kThreads];
+    float local_max = -INFINITY;
+    for (int j = threadIdx.x; j < topk; j += blockDim.x)
+        local_max = fmaxf(local_max, scores[j]);
+    reduce_buf[threadIdx.x] = local_max;
+    __syncthreads();
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (threadIdx.x < offset)
+            reduce_buf[threadIdx.x] =
+                fmaxf(reduce_buf[threadIdx.x], reduce_buf[threadIdx.x + offset]);
+        __syncthreads();
+    }
+    const float row_max = reduce_buf[0];
+
+    float local_sum = 0.0f;
+    for (int j = threadIdx.x; j < topk; j += blockDim.x) {
+        const float p = isfinite(row_max) ? expf(scores[j] - row_max) : 0.0f;
+        scores[j] = p;
+        local_sum += p;
+    }
+    reduce_buf[threadIdx.x] = local_sum;
+    __syncthreads();
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (threadIdx.x < offset)
+            reduce_buf[threadIdx.x] += reduce_buf[threadIdx.x + offset];
+        __syncthreads();
+    }
+    const float row_sum = reduce_buf[0];
+    const float row_lse = row_sum > 0.0f ? logf(row_sum) + row_max : -INFINITY;
+    for (int j = threadIdx.x; j < topk; j += blockDim.x)
+        scores[j] = row_sum > 0.0f ? scores[j] / row_sum : 0.0f;
+    __syncthreads();
+
+    const float sink = attn_sink == nullptr ? 0.0f : attn_sink[head];
+    const float gate =
+        attn_sink == nullptr ? 1.0f : 1.0f / (1.0f + expf(-(row_lse - sink)));
+    for (int d = threadIdx.x; d < kHeadDim; d += blockDim.x) {
+        float accum = 0.0f;
+        if (row_sum > 0.0f) {
+            for (int j = 0; j < limit; ++j) {
+                const float p = scores[j];
+                if (p == 0.0f || linear_s[j] < 0)
+                    continue;
+                const bool use_extra = source_s[j] != 0;
+                const uint8_t* selected_cache = use_extra ? extra_k_cache : k_cache;
+                const int64_t selected_stride =
+                    use_extra ? extra_cache_stride0_bytes : cache_stride0_bytes;
+                const int selected_block_size =
+                    use_extra ? extra_block_size : block_size;
+                const uint8_t* token_ptr = token_ptr_from_linear(
+                    selected_cache, selected_stride, selected_block_size,
+                    linear_s[j]);
+                const float* cand_scales =
+                    scale_s + static_cast<int64_t>(j) * kNumQuantBlocks;
+                accum += p * load_cache_value_from_token(token_ptr, cand_scales, d);
+            }
+        }
+        store_out_value<out_t>(
+            out, static_cast<int64_t>(token) * out_stride_t +
+                     static_cast<int64_t>(head) * out_stride_h +
+                     static_cast<int64_t>(d) * out_stride_d,
+            accum * gate);
+    }
+
+    if (threadIdx.x == 0)
+        lse[static_cast<int64_t>(token) * num_heads + head] = row_lse;
+}
+
+
 bool is_none(const pybind11::object& obj) {
     return obj.is_none();
 }
@@ -1965,10 +2403,11 @@ void launch_sparse_mla_prefill_from_workspace_split(
     DG_HOST_ASSERT(topk > 0);
     DG_HOST_ASSERT(topk <= 4096);
 
-    auto scores = torch::empty({num_tokens, active_heads, topk},
-                               q.options().dtype(torch::kFloat32));
     const auto stream = at::cuda::getCurrentCUDAStream();
     const int topk_kind = length_tensor_kind(topk_length);
+
+    auto scores = torch::empty({num_tokens, active_heads, topk},
+                               q.options().dtype(torch::kFloat32));
     const dim3 score_grid(
         (topk + kScoreCandidatesPerBlock - 1) / kScoreCandidatesPerBlock,
         active_heads, num_tokens);
@@ -2003,6 +2442,156 @@ void launch_sparse_mla_prefill_from_workspace_split(
             num_heads, kv_tokens, topk, kv.stride(0), kv.stride(2),
             indices.stride(0), indices.stride(2), out.stride(0),
             out.stride(1), out.stride(2), topk_kind);
+    DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
+}
+
+template <typename BlockT, typename SeqT, typename StartT>
+void launch_build_prefill_workspace_map(const torch::Tensor& out,
+                                        const torch::Tensor& block_table,
+                                        const torch::Tensor& seq_lens,
+                                        const torch::Tensor& workspace_starts,
+                                        int block_size) {
+    constexpr int kMapThreads = 256;
+    const int64_t out_rows = out.numel();
+    const int64_t init_blocks = (out_rows + kMapThreads - 1) / kMapThreads;
+    const int64_t num_reqs = block_table.size(0);
+    const int64_t grid_x = std::max<int64_t>(init_blocks, num_reqs);
+    if (grid_x <= 0)
+        return;
+    DG_HOST_ASSERT(grid_x <= std::numeric_limits<unsigned>::max());
+    const auto stream = at::cuda::getCurrentCUDAStream();
+    const dim3 grid(static_cast<unsigned>(grid_x), 2);
+    prefill_workspace_map_kernel<BlockT, SeqT, StartT>
+        <<<grid, kMapThreads, 0, stream>>>(
+            out.data_ptr<int32_t>(), block_table.data_ptr<BlockT>(),
+            seq_lens.data_ptr<SeqT>(), workspace_starts.data_ptr<StartT>(),
+            static_cast<int>(num_reqs), block_size, out_rows,
+            block_table.stride(0), block_table.stride(1), seq_lens.stride(0),
+            workspace_starts.stride(0));
+    DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
+}
+
+template <typename BlockT, typename SeqT, typename GatherT>
+void launch_build_prefill_strided_workspace_map(
+    const torch::Tensor& out, const torch::Tensor& block_table,
+    const torch::Tensor& seq_lens, const torch::Tensor& gather_lens,
+    int block_size, int64_t row_stride, int64_t offset, bool encode_negative) {
+    constexpr int kMapThreads = 256;
+    const int64_t num_reqs = block_table.size(0);
+    if (num_reqs <= 0 || out.numel() <= 0)
+        return;
+    DG_HOST_ASSERT(num_reqs <= std::numeric_limits<unsigned>::max());
+    const auto stream = at::cuda::getCurrentCUDAStream();
+    prefill_strided_workspace_map_kernel<BlockT, SeqT, GatherT>
+        <<<static_cast<unsigned>(num_reqs), kMapThreads, 0, stream>>>(
+            out.data_ptr<int32_t>(), block_table.data_ptr<BlockT>(),
+            seq_lens.data_ptr<SeqT>(),
+            gather_lens.defined() ? gather_lens.data_ptr<GatherT>() : nullptr,
+            static_cast<int>(num_reqs), block_size, out.numel(), row_stride,
+            offset, encode_negative, block_table.stride(0), block_table.stride(1),
+            seq_lens.stride(0), gather_lens.defined() ? gather_lens.stride(0) : 0);
+    DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
+}
+
+template <typename q_t, typename out_t, typename index_t>
+void launch_sparse_mla_prefill_from_fp8_workspace_map(
+    const torch::Tensor& q, const torch::Tensor& k_cache,
+    const torch::Tensor& extra_k_cache,
+    const torch::Tensor& workspace_map, const torch::Tensor& indices,
+    const torch::Tensor& topk_length, const torch::Tensor& attn_sink,
+    const torch::Tensor& out, const torch::Tensor& lse, int block_size,
+    int extra_block_size, double softmax_scale) {
+    const int num_tokens = static_cast<int>(q.size(0));
+    const int num_heads = static_cast<int>(q.size(1));
+    const int active_heads = sm120_active_heads(num_heads);
+    const int topk = static_cast<int>(indices.size(2));
+    DG_HOST_ASSERT(num_tokens > 0);
+    DG_HOST_ASSERT(num_heads > 0);
+    DG_HOST_ASSERT(active_heads > 0);
+    DG_HOST_ASSERT(topk > 0);
+    DG_HOST_ASSERT(topk <= 4096);
+
+    const auto stream = at::cuda::getCurrentCUDAStream();
+    const int topk_kind = length_tensor_kind(topk_length);
+    if (topk <= kMaxGroupedCandidateSlots) {
+        const size_t shared_bytes = grouped_decode_shared_bytes(topk);
+        sparse_mla_prefill_fp8_map_grouped_kernel<q_t, out_t, index_t>
+            <<<num_tokens * active_heads, kThreads, shared_bytes, stream>>>(
+                reinterpret_cast<const q_t*>(q.data_ptr()),
+                reinterpret_cast<const uint8_t*>(k_cache.data_ptr()),
+                extra_k_cache.defined()
+                    ? reinterpret_cast<const uint8_t*>(extra_k_cache.data_ptr())
+                    : nullptr,
+                workspace_map.data_ptr<int32_t>(),
+                reinterpret_cast<const index_t*>(indices.data_ptr()),
+                topk_length.defined() ? topk_length.data_ptr() : nullptr,
+                attn_sink.defined() ? attn_sink.data_ptr<float>() : nullptr,
+                reinterpret_cast<out_t*>(out.data_ptr()), lse.data_ptr<float>(),
+                num_tokens, active_heads, num_heads,
+                static_cast<int>(workspace_map.numel()), topk, block_size,
+                extra_block_size, k_cache.size(0),
+                extra_k_cache.defined() ? extra_k_cache.size(0) : 0,
+                byte_stride(k_cache, 0),
+                extra_k_cache.defined() ? byte_stride(extra_k_cache, 0) : 0,
+                q.stride(0), q.stride(1), q.stride(2), indices.stride(0),
+                indices.stride(2), out.stride(0), out.stride(1),
+                out.stride(2), topk_kind, static_cast<float>(softmax_scale));
+        DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
+        return;
+    }
+
+    auto scores = torch::empty({num_tokens, active_heads, topk},
+                               q.options().dtype(torch::kFloat32));
+    const dim3 score_grid(
+        (topk + kScoreCandidatesPerBlock - 1) / kScoreCandidatesPerBlock,
+        active_heads, num_tokens);
+    sparse_mla_prefill_fp8_map_score_tiled_kernel<q_t, index_t>
+        <<<score_grid, kThreads, 0, stream>>>(
+            reinterpret_cast<const q_t*>(q.data_ptr()),
+            reinterpret_cast<const uint8_t*>(k_cache.data_ptr()),
+            extra_k_cache.defined()
+                ? reinterpret_cast<const uint8_t*>(extra_k_cache.data_ptr())
+                : nullptr,
+            workspace_map.data_ptr<int32_t>(),
+            reinterpret_cast<const index_t*>(indices.data_ptr()),
+            topk_length.defined() ? topk_length.data_ptr() : nullptr,
+            scores.data_ptr<float>(), num_tokens, active_heads, num_heads,
+            static_cast<int>(workspace_map.numel()), topk, block_size,
+            extra_block_size, q.stride(0), q.stride(1), q.stride(2), k_cache.size(0),
+            extra_k_cache.defined() ? extra_k_cache.size(0) : 0,
+            byte_stride(k_cache, 0),
+            extra_k_cache.defined() ? byte_stride(extra_k_cache, 0) : 0,
+            indices.stride(0), indices.stride(2),
+            topk_kind, static_cast<float>(softmax_scale));
+    DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
+
+    sparse_mla_softmax_kernel<<<num_tokens * active_heads, kThreads, 0, stream>>>(
+        scores.data_ptr<float>(), lse.data_ptr<float>(),
+        attn_sink.defined() ? attn_sink.data_ptr<float>() : nullptr, num_tokens,
+        num_heads, active_heads, topk);
+    DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
+
+    const dim3 out_grid(num_tokens * active_heads,
+                        (kHeadDim + kThreads - 1) / kThreads);
+    sparse_mla_prefill_fp8_map_output_kernel<out_t, index_t>
+        <<<out_grid, kThreads, 0, stream>>>(
+            reinterpret_cast<const uint8_t*>(k_cache.data_ptr()),
+            extra_k_cache.defined()
+                ? reinterpret_cast<const uint8_t*>(extra_k_cache.data_ptr())
+                : nullptr,
+            workspace_map.data_ptr<int32_t>(),
+            reinterpret_cast<const index_t*>(indices.data_ptr()),
+            topk_length.defined() ? topk_length.data_ptr() : nullptr,
+            scores.data_ptr<float>(), lse.data_ptr<float>(),
+            attn_sink.defined() ? attn_sink.data_ptr<float>() : nullptr,
+            reinterpret_cast<out_t*>(out.data_ptr()), num_tokens, active_heads,
+            num_heads, static_cast<int>(workspace_map.numel()), topk,
+            block_size, extra_block_size, k_cache.size(0),
+            extra_k_cache.defined() ? extra_k_cache.size(0) : 0,
+            byte_stride(k_cache, 0),
+            extra_k_cache.defined() ? byte_stride(extra_k_cache, 0) : 0,
+            indices.stride(0), indices.stride(2), out.stride(0), out.stride(1),
+            out.stride(2), topk_kind);
     DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
 }
 
@@ -2994,6 +3583,298 @@ sparse_mla_prefill_from_bf16_workspace_split(
     return std::make_tuple(out, max_logits, lse);
 }
 
+void build_prefill_workspace_map(const torch::Tensor& out,
+                                 const torch::Tensor& block_table,
+                                 const torch::Tensor& seq_lens,
+                                 const torch::Tensor& workspace_starts,
+                                 int block_size) {
+    DG_HOST_ASSERT(out.is_cuda() && block_table.is_cuda() && seq_lens.is_cuda() &&
+                   workspace_starts.is_cuda());
+    DG_HOST_ASSERT(out.scalar_type() == torch::kInt32);
+    DG_HOST_ASSERT(out.dim() == 1);
+    DG_HOST_ASSERT(block_table.dim() == 2);
+    DG_HOST_ASSERT(seq_lens.dim() == 1);
+    DG_HOST_ASSERT(workspace_starts.dim() == 1);
+    DG_HOST_ASSERT(block_table.size(0) <= seq_lens.numel());
+    DG_HOST_ASSERT(block_table.size(0) <= workspace_starts.numel());
+    DG_HOST_ASSERT(block_size > 0);
+    DG_HOST_ASSERT(block_table.scalar_type() == torch::kInt32 ||
+                   block_table.scalar_type() == torch::kInt64);
+    DG_HOST_ASSERT(seq_lens.scalar_type() == torch::kInt32 ||
+                   seq_lens.scalar_type() == torch::kInt64);
+    DG_HOST_ASSERT(workspace_starts.scalar_type() == torch::kInt32 ||
+                   workspace_starts.scalar_type() == torch::kInt64);
+
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(out));
+
+#define DISPATCH_START(BLOCK_T, SEQ_T)                                             \
+    do {                                                                           \
+        if (workspace_starts.scalar_type() == torch::kInt32) {                     \
+            launch_build_prefill_workspace_map<BLOCK_T, SEQ_T, int32_t>(           \
+                out, block_table, seq_lens, workspace_starts, block_size);         \
+        } else {                                                                   \
+            launch_build_prefill_workspace_map<BLOCK_T, SEQ_T, int64_t>(           \
+                out, block_table, seq_lens, workspace_starts, block_size);         \
+        }                                                                          \
+    } while (0)
+
+#define DISPATCH_SEQ(BLOCK_T)                                                      \
+    do {                                                                           \
+        if (seq_lens.scalar_type() == torch::kInt32) {                             \
+            DISPATCH_START(BLOCK_T, int32_t);                                      \
+        } else {                                                                   \
+            DISPATCH_START(BLOCK_T, int64_t);                                      \
+        }                                                                          \
+    } while (0)
+
+    if (block_table.scalar_type() == torch::kInt32) {
+        DISPATCH_SEQ(int32_t);
+    } else {
+        DISPATCH_SEQ(int64_t);
+    }
+
+#undef DISPATCH_SEQ
+#undef DISPATCH_START
+}
+
+void build_prefill_strided_workspace_map(
+    const torch::Tensor& out, const torch::Tensor& block_table,
+    const torch::Tensor& seq_lens, const pybind11::object& gather_lens_obj,
+    int block_size, int64_t row_stride, int64_t offset, bool encode_negative) {
+    DG_HOST_ASSERT(out.is_cuda() && block_table.is_cuda() && seq_lens.is_cuda());
+    DG_HOST_ASSERT(out.scalar_type() == torch::kInt32);
+    DG_HOST_ASSERT(out.dim() == 1);
+    DG_HOST_ASSERT(block_table.dim() == 2);
+    DG_HOST_ASSERT(seq_lens.dim() == 1);
+    DG_HOST_ASSERT(block_table.size(0) <= seq_lens.numel());
+    DG_HOST_ASSERT(block_size > 0);
+    DG_HOST_ASSERT(row_stride > 0);
+    DG_HOST_ASSERT(offset >= 0 && offset < row_stride);
+    DG_HOST_ASSERT(block_table.scalar_type() == torch::kInt32 ||
+                   block_table.scalar_type() == torch::kInt64);
+    DG_HOST_ASSERT(seq_lens.scalar_type() == torch::kInt32 ||
+                   seq_lens.scalar_type() == torch::kInt64);
+    auto gather_lens = tensor_or_empty(gather_lens_obj);
+    if (gather_lens.defined()) {
+        DG_HOST_ASSERT(gather_lens.is_cuda());
+        DG_HOST_ASSERT(gather_lens.dim() == 1);
+        DG_HOST_ASSERT(block_table.size(0) <= gather_lens.numel());
+        DG_HOST_ASSERT(gather_lens.scalar_type() == torch::kInt32 ||
+                       gather_lens.scalar_type() == torch::kInt64);
+    }
+
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(out));
+
+#define DISPATCH_GATHER(BLOCK_T, SEQ_T)                                            \
+    do {                                                                           \
+        if (!gather_lens.defined() || gather_lens.scalar_type() == torch::kInt64) { \
+            launch_build_prefill_strided_workspace_map<BLOCK_T, SEQ_T, int64_t>(   \
+                out, block_table, seq_lens, gather_lens, block_size, row_stride,   \
+                offset, encode_negative);                                          \
+        } else {                                                                   \
+            launch_build_prefill_strided_workspace_map<BLOCK_T, SEQ_T, int32_t>(   \
+                out, block_table, seq_lens, gather_lens, block_size, row_stride,   \
+                offset, encode_negative);                                          \
+        }                                                                          \
+    } while (0)
+
+#define DISPATCH_SEQ(BLOCK_T)                                                      \
+    do {                                                                           \
+        if (seq_lens.scalar_type() == torch::kInt32) {                             \
+            DISPATCH_GATHER(BLOCK_T, int32_t);                                     \
+        } else {                                                                   \
+            DISPATCH_GATHER(BLOCK_T, int64_t);                                     \
+        }                                                                          \
+    } while (0)
+
+    if (block_table.scalar_type() == torch::kInt32) {
+        DISPATCH_SEQ(int32_t);
+    } else {
+        DISPATCH_SEQ(int64_t);
+    }
+
+#undef DISPATCH_SEQ
+#undef DISPATCH_GATHER
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+sparse_mla_prefill_from_fp8_workspace_map(
+    const torch::Tensor& q, const torch::Tensor& k_cache,
+    const torch::Tensor& workspace_map, const torch::Tensor& indices,
+    const pybind11::object& topk_length_obj,
+    const pybind11::object& attn_sink_obj, int block_size, int head_dim_v,
+    double softmax_scale, const pybind11::object& out_obj) {
+    DG_HOST_ASSERT(q.is_cuda() && k_cache.is_cuda() && workspace_map.is_cuda() &&
+                   indices.is_cuda());
+    DG_HOST_ASSERT(q.dim() == 3 && q.size(2) == kHeadDim);
+    DG_HOST_ASSERT(k_cache.dim() >= 4 && k_cache.size(2) == 1);
+    DG_HOST_ASSERT(k_cache.size(k_cache.dim() - 1) >= kTokenDataBytes + kScaleBytes);
+    DG_HOST_ASSERT(workspace_map.dim() == 1 &&
+                   workspace_map.scalar_type() == torch::kInt32);
+    DG_HOST_ASSERT(indices.dim() == 3 && indices.size(0) == q.size(0) &&
+                   indices.size(1) == 1);
+    DG_HOST_ASSERT(head_dim_v == kHeadDim);
+    DG_HOST_ASSERT(block_size > 0);
+
+    auto topk_length = tensor_or_empty(topk_length_obj);
+    auto attn_sink = tensor_or_empty(attn_sink_obj);
+    if (topk_length.defined()) {
+        DG_HOST_ASSERT(topk_length.is_cuda() && topk_length.numel() >= q.size(0));
+        DG_HOST_ASSERT(topk_length.scalar_type() == torch::kInt ||
+                       topk_length.scalar_type() == torch::kInt64);
+    }
+    if (attn_sink.defined() && attn_sink.scalar_type() != torch::kFloat32)
+        attn_sink = attn_sink.to(torch::kFloat32);
+
+    torch::Tensor out;
+    if (is_none(out_obj)) {
+        out = torch::empty({q.size(0), q.size(1), head_dim_v}, q.options());
+    } else {
+        out = out_obj.cast<torch::Tensor>();
+    }
+    auto max_logits =
+        torch::empty({q.size(0), q.size(1)}, q.options().dtype(torch::kFloat32));
+    auto lse =
+        torch::empty({q.size(0), q.size(1)}, q.options().dtype(torch::kFloat32));
+
+    const auto stream = at::cuda::getCurrentCUDAStream();
+    static sm120_profile::KernelProfileCounter profile_counter(
+        "sm120_sparse_mla_prefill_fp8_map");
+    sm120_profile::ScopedTimer profile_timer(
+        profile_counter, stream, static_cast<int>(q.size(0)),
+        static_cast<int>(q.size(1)), static_cast<int>(indices.size(2)), 1);
+
+    if (q.scalar_type() == torch::kBFloat16 &&
+        out.scalar_type() == torch::kBFloat16) {
+        if (indices.scalar_type() == torch::kInt64) {
+            launch_sparse_mla_prefill_from_fp8_workspace_map<
+                __nv_bfloat16, __nv_bfloat16, int64_t>(
+                q, k_cache, torch::Tensor(), workspace_map, indices, topk_length, attn_sink, out,
+                lse, block_size, block_size, softmax_scale);
+        } else if (indices.scalar_type() == torch::kInt32) {
+            launch_sparse_mla_prefill_from_fp8_workspace_map<
+                __nv_bfloat16, __nv_bfloat16, int32_t>(
+                q, k_cache, torch::Tensor(), workspace_map, indices, topk_length, attn_sink, out,
+                lse, block_size, block_size, softmax_scale);
+        } else {
+            DG_HOST_UNREACHABLE(
+                "SM120 direct FP8 sparse MLA prefill indices must be int32 or int64");
+        }
+    } else if (q.scalar_type() == torch::kFloat16 &&
+               out.scalar_type() == torch::kFloat16) {
+        if (indices.scalar_type() == torch::kInt64) {
+            launch_sparse_mla_prefill_from_fp8_workspace_map<half, half, int64_t>(
+                q, k_cache, torch::Tensor(), workspace_map, indices, topk_length, attn_sink, out,
+                lse, block_size, block_size, softmax_scale);
+        } else if (indices.scalar_type() == torch::kInt32) {
+            launch_sparse_mla_prefill_from_fp8_workspace_map<half, half, int32_t>(
+                q, k_cache, torch::Tensor(), workspace_map, indices, topk_length, attn_sink, out,
+                lse, block_size, block_size, softmax_scale);
+        } else {
+            DG_HOST_UNREACHABLE(
+                "SM120 direct FP8 sparse MLA prefill indices must be int32 or int64");
+        }
+    } else {
+        DG_HOST_UNREACHABLE(
+            "SM120 direct FP8 sparse MLA prefill currently supports bf16 or fp16 q/out");
+    }
+
+    max_logits.fill_(std::numeric_limits<float>::quiet_NaN());
+    return std::make_tuple(out, max_logits, lse);
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+sparse_mla_prefill_from_two_fp8_workspace_map(
+    const torch::Tensor& q, const torch::Tensor& primary_k_cache,
+    const torch::Tensor& extra_k_cache, const torch::Tensor& workspace_map,
+    const torch::Tensor& indices, const pybind11::object& topk_length_obj,
+    const pybind11::object& attn_sink_obj, int primary_block_size, int extra_block_size, int head_dim_v,
+    double softmax_scale, const pybind11::object& out_obj) {
+    DG_HOST_ASSERT(q.is_cuda() && primary_k_cache.is_cuda() &&
+                   extra_k_cache.is_cuda() && workspace_map.is_cuda() &&
+                   indices.is_cuda());
+    DG_HOST_ASSERT(q.dim() == 3 && q.size(2) == kHeadDim);
+    DG_HOST_ASSERT(primary_k_cache.dim() >= 4 && primary_k_cache.size(2) == 1);
+    DG_HOST_ASSERT(extra_k_cache.dim() >= 4 && extra_k_cache.size(2) == 1);
+    DG_HOST_ASSERT(primary_k_cache.size(primary_k_cache.dim() - 1) >=
+                   kTokenDataBytes + kScaleBytes);
+    DG_HOST_ASSERT(extra_k_cache.size(extra_k_cache.dim() - 1) >=
+                   kTokenDataBytes + kScaleBytes);
+    DG_HOST_ASSERT(workspace_map.dim() == 1 &&
+                   workspace_map.scalar_type() == torch::kInt32);
+    DG_HOST_ASSERT(indices.dim() == 3 && indices.size(0) == q.size(0) &&
+                   indices.size(1) == 1);
+    DG_HOST_ASSERT(head_dim_v == kHeadDim);
+    DG_HOST_ASSERT(primary_block_size > 0);
+    DG_HOST_ASSERT(extra_block_size > 0);
+
+    auto topk_length = tensor_or_empty(topk_length_obj);
+    auto attn_sink = tensor_or_empty(attn_sink_obj);
+    if (topk_length.defined()) {
+        DG_HOST_ASSERT(topk_length.is_cuda() && topk_length.numel() >= q.size(0));
+        DG_HOST_ASSERT(topk_length.scalar_type() == torch::kInt ||
+                       topk_length.scalar_type() == torch::kInt64);
+    }
+    if (attn_sink.defined() && attn_sink.scalar_type() != torch::kFloat32)
+        attn_sink = attn_sink.to(torch::kFloat32);
+
+    torch::Tensor out;
+    if (is_none(out_obj)) {
+        out = torch::empty({q.size(0), q.size(1), head_dim_v}, q.options());
+    } else {
+        out = out_obj.cast<torch::Tensor>();
+    }
+    auto max_logits =
+        torch::empty({q.size(0), q.size(1)}, q.options().dtype(torch::kFloat32));
+    auto lse =
+        torch::empty({q.size(0), q.size(1)}, q.options().dtype(torch::kFloat32));
+
+    const auto stream = at::cuda::getCurrentCUDAStream();
+    static sm120_profile::KernelProfileCounter profile_counter(
+        "sm120_sparse_mla_prefill_two_fp8_map");
+    sm120_profile::ScopedTimer profile_timer(
+        profile_counter, stream, static_cast<int>(q.size(0)),
+        static_cast<int>(q.size(1)), static_cast<int>(indices.size(2)), 1);
+
+    if (q.scalar_type() == torch::kBFloat16 &&
+        out.scalar_type() == torch::kBFloat16) {
+        if (indices.scalar_type() == torch::kInt64) {
+            launch_sparse_mla_prefill_from_fp8_workspace_map<
+                __nv_bfloat16, __nv_bfloat16, int64_t>(
+                q, primary_k_cache, extra_k_cache, workspace_map, indices,
+                topk_length, attn_sink, out, lse, primary_block_size, extra_block_size, softmax_scale);
+        } else if (indices.scalar_type() == torch::kInt32) {
+            launch_sparse_mla_prefill_from_fp8_workspace_map<
+                __nv_bfloat16, __nv_bfloat16, int32_t>(
+                q, primary_k_cache, extra_k_cache, workspace_map, indices,
+                topk_length, attn_sink, out, lse, primary_block_size, extra_block_size, softmax_scale);
+        } else {
+            DG_HOST_UNREACHABLE(
+                "SM120 direct two-cache FP8 prefill indices must be int32 or int64");
+        }
+    } else if (q.scalar_type() == torch::kFloat16 &&
+               out.scalar_type() == torch::kFloat16) {
+        if (indices.scalar_type() == torch::kInt64) {
+            launch_sparse_mla_prefill_from_fp8_workspace_map<half, half, int64_t>(
+                q, primary_k_cache, extra_k_cache, workspace_map, indices,
+                topk_length, attn_sink, out, lse, primary_block_size, extra_block_size, softmax_scale);
+        } else if (indices.scalar_type() == torch::kInt32) {
+            launch_sparse_mla_prefill_from_fp8_workspace_map<half, half, int32_t>(
+                q, primary_k_cache, extra_k_cache, workspace_map, indices,
+                topk_length, attn_sink, out, lse, primary_block_size, extra_block_size, softmax_scale);
+        } else {
+            DG_HOST_UNREACHABLE(
+                "SM120 direct two-cache FP8 prefill indices must be int32 or int64");
+        }
+    } else {
+        DG_HOST_UNREACHABLE(
+            "SM120 direct two-cache FP8 sparse MLA prefill supports bf16/fp16 q/out");
+    }
+
+    max_logits.fill_(std::numeric_limits<float>::quiet_NaN());
+    return std::make_tuple(out, max_logits, lse);
+}
+
 void register_apis(pybind11::module& m) {
     m.def("sm120_sparse_mla_decode", &sparse_mla_decode,
           "SM120 sparse MLA decode for DeepSeek-V4 Flash");
@@ -3022,6 +3903,18 @@ void register_apis(pybind11::module& m) {
     m.def("sm120_sparse_mla_prefill_from_bf16_workspace_split",
           &sparse_mla_prefill_from_bf16_workspace_split,
           "SM120 split sparse MLA prefill directly from indexed BF16/FP16 KV");
+    m.def("sm120_build_prefill_workspace_map",
+          &build_prefill_workspace_map,
+          "SM120 map FP8 prefill chunk workspace rows to physical KV slots");
+    m.def("sm120_build_prefill_strided_workspace_map",
+          &build_prefill_strided_workspace_map,
+          "SM120 map strided DeepSeek-V4 prefill workspace rows to physical KV slots");
+    m.def("sm120_sparse_mla_prefill_from_fp8_workspace_map",
+          &sparse_mla_prefill_from_fp8_workspace_map,
+          "SM120 sparse MLA prefill directly from FP8 KV cache plus workspace map");
+    m.def("sm120_sparse_mla_prefill_from_two_fp8_workspace_map",
+          &sparse_mla_prefill_from_two_fp8_workspace_map,
+          "SM120 sparse MLA prefill directly from compressed+SWA FP8 KV caches");
     m.def("sm120_fill_decode_all_indices", &fill_decode_all_indices,
           "SM120 fill full-context sparse decode indices");
 }

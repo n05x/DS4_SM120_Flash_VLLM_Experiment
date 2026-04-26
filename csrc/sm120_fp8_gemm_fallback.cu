@@ -2079,14 +2079,14 @@ void sm120_fp8_bhr_hdr_bhd(const torch::Tensor& a,
             const bool use_m1_mma =
                 env_flag_enabled("DG_SM120_ENABLE_BHR_M1_MMA") &&
                 out.scalar_type() == torch::kBFloat16 && a_scale_type == 1 &&
-                b_scale_type == 1 && R % 128 == 0 && D % 8 == 0 &&
+                b_scale_type == 1 && R <= 1024 && R % 128 == 0 && D % 8 == 0 &&
                 b_scale_gran_d == 128;
             const bool use_decode_warp_col =
                 R <= 512 && D <= 2048 && B * H <= 64;
             const bool use_prefill_warp_col =
                 R <= 512 && D <= 2048 && B * H > 64;
             const bool use_long_warp_col =
-                R >= 2048 && D <= 4096 && B * H <= 64;
+                R > 1024 && D <= 4096 && B * H <= 64;
             const bool use_warp_col =
                 env_flag_enabled("DG_SM120_ENABLE_BHR_WARPCOL") ||
                 (env_flag_enabled("DG_SM120_ENABLE_BHR_WARPCOL_HEURISTIC") &&
