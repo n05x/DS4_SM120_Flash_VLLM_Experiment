@@ -22,3 +22,7 @@ stubs/
 
 # Symlinks to compiled extensions
 deep_gemm/*.so
+# Local development artifacts (auto-added)
+venv/
+DeepGEMM/
+extracted/
