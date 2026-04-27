@@ -215,6 +215,22 @@ __host__ __forceinline__ bool sm120_output_mma_scalar_check() {
     return enabled;
 }
 
+// OUTPUT_FUSED_SOFTMAX — fold the small softmax kernel into the output
+// kernel, eliminating one launch + one DRAM round-trip on `scores`.
+// Reads RAW scores, computes max/exp/sum/lse in smem, applies inv_sum to
+// smem-resident probabilities, then runs the existing sstat-style PV
+// loop. lse is written by the same block. Numerics match the
+// softmax+sstat sequence at the source level (same op order: divide
+// each prob by row_sum BEFORE the kv multiply).
+__host__ __forceinline__ bool sm120_output_fused_softmax_enabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("DG_SM120_OUTPUT_FUSED_SOFTMAX");
+        if (env == nullptr || env[0] == '\0') return false;
+        return env[0] != '0';
+    }();
+    return enabled;
+}
+
 template <typename T>
 __device__ __forceinline__ float load_q_value(const T* q, int64_t offset) {
     return static_cast<float>(q[offset]);
@@ -2091,6 +2107,138 @@ __global__ void sparse_mla_workspace_output_sstat_kernel(
         accum * gate);
 }
 
+// Fused softmax + output kernel (stepping stone toward full flash-fusion).
+//
+// Reads RAW (un-softmaxed) scores from DRAM, computes max/exp/sum/lse in
+// dynamic smem (size = candidate_slots * sizeof(float)), divides each
+// smem slot by row_sum to produce probabilities, then runs the same
+// per-thread PV loop as `sparse_mla_workspace_output_sstat_kernel`. lse
+// is written by thread 0 of each (b, h, tile=0) block.
+//
+// Numerics: the softmax is computed inline (same -inf gating, same
+// expf - row_max formula), then probabilities are normalized in smem
+// before the PV multiply. Multiplication / accumulation order in the PV
+// loop is preserved → bit-identical to softmax_kernel + sstat_kernel
+// when the hardware exp/log matches (it does — same intrinsics).
+//
+// Grid: (batch * active_heads, ceil(kHeadDim/blockDim.x)) — same as the
+// stand-alone sstat output kernel. Saves one kernel launch per
+// (chunk × layer) and one fp32 DRAM round-trip on `scores` per (b, h).
+template <typename kv_t, typename out_t>
+__global__ void sparse_mla_workspace_output_fused_softmax_kernel(
+    const kv_t* __restrict__ kv_workspace, const void* __restrict__ topk_length,
+    const void* __restrict__ extra_topk_length,
+    const float* __restrict__ scores, const float* __restrict__ attn_sink,
+    out_t* __restrict__ out, float* __restrict__ lse, int batch_size,
+    int active_heads, int num_heads, int main_topk, int extra_topk,
+    int candidate_slots, int64_t kv_stride_b, int64_t kv_stride_s,
+    int64_t kv_stride_d, int64_t out_stride_b, int64_t out_stride_h,
+    int64_t out_stride_d, int topk_length_kind, int extra_topk_length_kind) {
+    extern __shared__ float s_smem[];
+    __shared__ float reduce_buf[kThreads];
+
+    const int bh = blockIdx.x;
+    const int tile = blockIdx.y;
+    const int b = bh / active_heads;
+    const int h = bh - b * active_heads;
+    if (b >= batch_size) return;
+
+    const int main_limit = max(
+        0, min(main_topk,
+               load_length_value(topk_length, topk_length_kind, b, main_topk)));
+    const int extra_limit =
+        max(0, min(extra_topk,
+                   load_length_value(extra_topk_length, extra_topk_length_kind,
+                                     b, extra_topk)));
+
+    const int64_t score_base =
+        (static_cast<int64_t>(b) * active_heads + h) * candidate_slots;
+
+    // Pass 1: load raw scores into smem and find row_max.
+    // (sstat path also stages scores once; we add the max/exp/sum work
+    //  inline rather than reading post-softmax scores from DRAM.)
+    float local_max = -INFINITY;
+    for (int s = threadIdx.x; s < candidate_slots; s += blockDim.x) {
+        const float v = scores[score_base + s];
+        s_smem[s] = v;
+        local_max = fmaxf(local_max, v);
+    }
+    reduce_buf[threadIdx.x] = local_max;
+    __syncthreads();
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (threadIdx.x < offset)
+            reduce_buf[threadIdx.x] =
+                fmaxf(reduce_buf[threadIdx.x], reduce_buf[threadIdx.x + offset]);
+        __syncthreads();
+    }
+    const float row_max = reduce_buf[0];
+
+    // Pass 2: in-place exp(- row_max) on smem + sum.
+    float local_sum = 0.0f;
+    for (int s = threadIdx.x; s < candidate_slots; s += blockDim.x) {
+        const float v = s_smem[s];
+        const float p = isfinite(row_max) ? expf(v - row_max) : 0.0f;
+        s_smem[s] = p;
+        local_sum += p;
+    }
+    reduce_buf[threadIdx.x] = local_sum;
+    __syncthreads();
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (threadIdx.x < offset)
+            reduce_buf[threadIdx.x] += reduce_buf[threadIdx.x + offset];
+        __syncthreads();
+    }
+    const float row_sum = reduce_buf[0];
+    const float row_lse = row_sum > 0.0f ? logf(row_sum) + row_max : -INFINITY;
+
+    // Pass 3: divide each smem slot by row_sum to get probabilities.
+    // Match the stand-alone softmax_kernel's order of ops exactly so the
+    // PV loop sees the same per-slot values as the existing path.
+    for (int s = threadIdx.x; s < candidate_slots; s += blockDim.x) {
+        s_smem[s] = row_sum > 0.0f ? (s_smem[s] / row_sum) : 0.0f;
+    }
+    __syncthreads();
+
+    // Each (b, h, tile=0) block writes lse — match the softmax_kernel
+    // contract so downstream code (e.g. the prefill workspace lse copy)
+    // sees the right value.
+    if (tile == 0 && threadIdx.x == 0)
+        lse[static_cast<int64_t>(b) * num_heads + h] = row_lse;
+
+    const int d = tile * blockDim.x + threadIdx.x;
+    if (d >= kHeadDim) return;
+
+    // Pass 4: PV loop, identical structure to sstat output kernel so
+    // multiplication / accumulation order is preserved.
+    float accum = 0.0f;
+    for (int j = 0; j < main_limit; ++j) {
+        accum += s_smem[j] *
+                 load_workspace_value<kv_t>(
+                     kv_workspace,
+                     static_cast<int64_t>(b) * kv_stride_b +
+                         static_cast<int64_t>(j) * kv_stride_s +
+                         static_cast<int64_t>(d) * kv_stride_d);
+    }
+    for (int j = 0; j < extra_limit; ++j) {
+        const int workspace_j = main_topk + j;
+        accum += s_smem[workspace_j] *
+                 load_workspace_value<kv_t>(
+                     kv_workspace,
+                     static_cast<int64_t>(b) * kv_stride_b +
+                         static_cast<int64_t>(workspace_j) * kv_stride_s +
+                         static_cast<int64_t>(d) * kv_stride_d);
+    }
+
+    const float sink = attn_sink == nullptr ? 0.0f : attn_sink[h];
+    const float gate =
+        attn_sink == nullptr ? 1.0f : 1.0f / (1.0f + expf(-(row_lse - sink)));
+    store_out_value<out_t>(
+        out, static_cast<int64_t>(b) * out_stride_b +
+                 static_cast<int64_t>(h) * out_stride_h +
+                 static_cast<int64_t>(d) * out_stride_d,
+        accum * gate);
+}
+
 // ===== OUTPUT MMA =========================================================
 // Layout (production active_heads=32, candidate_slots≤128, kHeadDim=512):
 //   block tile  : M=32 (all active heads), N=8 (one dim slice), K=128
@@ -3281,15 +3429,38 @@ void launch_sparse_mla_decode_from_workspace_split(
     }
     DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
 
-    sparse_mla_softmax_kernel<<<batch_size * active_heads, kThreads, 0, stream>>>(
-        scores.data_ptr<float>(), lse.data_ptr<float>(),
-        attn_sink.defined() ? attn_sink.data_ptr<float>() : nullptr, batch_size,
-        num_heads, active_heads, candidate_slots);
-    DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
+    const bool fused_softmax_path =
+        fast_path && sm120_output_fused_softmax_enabled();
+    if (!fused_softmax_path) {
+        sparse_mla_softmax_kernel<<<batch_size * active_heads, kThreads, 0,
+                                    stream>>>(
+            scores.data_ptr<float>(), lse.data_ptr<float>(),
+            attn_sink.defined() ? attn_sink.data_ptr<float>() : nullptr,
+            batch_size, num_heads, active_heads, candidate_slots);
+        DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
+    }
 
     const dim3 out_grid(batch_size * active_heads,
                         (kHeadDim + kThreads - 1) / kThreads);
-    if (fast_path && sm120_output_mma_enabled() &&
+    if (fused_softmax_path) {
+        const size_t out_smem_bytes =
+            static_cast<size_t>(candidate_slots) * sizeof(float);
+        sparse_mla_workspace_output_fused_softmax_kernel<kv_t, out_t>
+            <<<out_grid, kThreads, out_smem_bytes, stream>>>(
+                reinterpret_cast<const kv_t*>(kv_workspace.data_ptr()),
+                topk_length.defined() ? topk_length.data_ptr() : nullptr,
+                extra_topk_length.defined() ? extra_topk_length.data_ptr()
+                                            : nullptr,
+                scores.data_ptr<float>(),
+                attn_sink.defined() ? attn_sink.data_ptr<float>() : nullptr,
+                reinterpret_cast<out_t*>(out.data_ptr()),
+                lse.data_ptr<float>(), batch_size, active_heads, num_heads,
+                main_topk, extra_topk, candidate_slots,
+                kv_workspace.stride(0), kv_workspace.stride(1),
+                kv_workspace.stride(2), out.stride(0), out.stride(2),
+                out.stride(3), length_tensor_kind(topk_length),
+                length_tensor_kind(extra_topk_length));
+    } else if (fast_path && sm120_output_mma_enabled() &&
         active_heads <= kOutMmaM && candidate_slots <= kOutMmaKMax) {
         const dim3 out_mma_grid(batch_size,
                                 (kHeadDim + kOutMmaN - 1) / kOutMmaN);
